@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>现实触及</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">我会来到你身边</p>
+      <h1>现实触及</h1>
+    </div>
+    <button id="refresh" class="icon-button" type="button" title="刷新" aria-label="刷新">↻</button>
+  </header>
+  <main>
+    <section class="status-band" aria-label="运行状态">
+      <div><span>总开关</span><strong id="global-status">读取中</strong></div>
+      <div><span>主插件联动</span><strong id="link-status">读取中</strong></div>
+      <div><span>音频授权</span><strong id="audio-count">0</strong></div>
+      <div><span>摄像头授权</span><strong id="camera-count">0</strong></div>
+    </section>
+
+    <section class="section">
+      <div class="section-heading">
+        <div><h2>本机设备</h2><p>设备开关在插件配置中管理；这里用于检查运行状态和执行测试。</p></div>
+      </div>
+      <div class="device-grid">
+        <article class="device-card">
+          <div class="device-card__heading"><div><span class="device-kicker">AUDIO</span><h3>音频输出</h3></div><span id="audio-backend" class="status-pill">读取中</span></div>
+          <label>输出设备<select id="audio-device"></select></label>
+          <label>测试音量 <output id="volume-output">35%</output><input id="volume" type="range" min="0" max="100" value="35" /></label>
+          <button id="save-audio" class="button" type="button">保存设备</button>
+          <button id="test-audio" class="button secondary" type="button">播放测试音</button>
+          <p id="audio-detail" class="detail"></p>
+        </article>
+        <article class="device-card">
+          <div class="device-card__heading"><div><span class="device-kicker">CAMERA</span><h3>摄像头单帧</h3></div><span id="camera-backend" class="status-pill">读取中</span></div>
+          <button id="scan-camera" class="button" type="button">扫描摄像头</button>
+          <div id="camera-devices" class="device-list"></div>
+          <p id="camera-detail" class="detail"></p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-heading"><div><h2>用户与授权</h2><p>音频和摄像头相互独立；页面不会代替用户完成知情确认。</p></div></div>
+      <div id="users" class="user-list"></div>
+    </section>
+  </main>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="./app.js"></script>
+</body>
+</html>

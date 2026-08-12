@@ -1,0 +1,7 @@
+# AstrBot supplies the astrbot package.
+aiohttp>=3.10,<4
+numpy>=1.26,<3
+sounddevice>=0.5,<1
+soundfile>=0.12,<1
+opencv-python-headless>=4.10,<5
+cv2-enumerate-cameras>=1.3,<2

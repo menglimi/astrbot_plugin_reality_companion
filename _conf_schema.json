@@ -1,0 +1,164 @@
+{
+  "enabled": {
+    "description": "启用现实触及",
+    "type": "bool",
+    "hint": "总开关。开启不等于用户授权；音频和摄像头仍需分别在私聊中完成知情确认。",
+    "default": false
+  },
+  "authorized_user_ids": {
+    "description": "独立授权用户 ID",
+    "type": "list",
+    "hint": "未安装“我会永远陪着你”时使用。安装联动主插件后，其管理员和主要用户会自动获得发起授权的资格。",
+    "default": []
+  },
+  "vision_provider_id": {
+    "description": "摄像头视觉模型",
+    "type": "string",
+    "hint": "选择支持图片输入的 Provider ID。留空时只返回本地亮度和分辨率，不进行场景理解。",
+    "default": ""
+  },
+  "audio": {
+    "description": "本机音频",
+    "type": "object",
+    "items": {
+      "default_playback_volume": {
+        "description": "默认播放音量",
+        "type": "int",
+        "slider": {"min": 0, "max": 100, "step": 1},
+        "default": 35
+      }
+    }
+  },
+  "camera": {
+    "description": "摄像头单帧",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用摄像头单帧",
+        "type": "bool",
+        "default": false
+      },
+      "index": {
+        "description": "摄像头索引",
+        "type": "int",
+        "default": 0,
+        "condition": {"enabled": true}
+      },
+      "min_interval_seconds": {
+        "description": "同一用户最小读取间隔（秒）",
+        "type": "int",
+        "slider": {"min": 10, "max": 3600, "step": 10},
+        "default": 60,
+        "condition": {"enabled": true}
+      },
+      "capture_timeout_seconds": {
+        "description": "设备读取超时（秒）",
+        "type": "int",
+        "slider": {"min": 2, "max": 20, "step": 1},
+        "default": 5,
+        "condition": {"enabled": true}
+      },
+      "analysis_timeout_seconds": {
+        "description": "视觉分析超时（秒）",
+        "type": "int",
+        "slider": {"min": 5, "max": 90, "step": 5},
+        "default": 25,
+        "condition": {"enabled": true}
+      },
+      "proactive_curiosity_enabled": {
+        "description": "允许主动视觉好奇",
+        "type": "bool",
+        "default": false,
+        "condition": {"enabled": true}
+      },
+      "proactive_min_tier": {
+        "description": "允许直接主动单帧的最低陪伴档位",
+        "type": "int",
+        "slider": {"min": 1, "max": 5, "step": 1},
+        "default": 4,
+        "condition": {"proactive_curiosity_enabled": true}
+      },
+      "proactive_max_daily": {
+        "description": "主动单帧每日上限",
+        "type": "int",
+        "slider": {"min": 0, "max": 10, "step": 1},
+        "default": 1,
+        "condition": {"proactive_curiosity_enabled": true}
+      },
+      "proactive_cooldown_minutes": {
+        "description": "主动单帧冷却（分钟）",
+        "type": "int",
+        "slider": {"min": 10, "max": 1440, "step": 10},
+        "default": 240,
+        "condition": {"proactive_curiosity_enabled": true}
+      }
+    }
+  },
+  "timezone": {
+    "description": "提醒时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "mobile": {
+    "description": "陪伴终端 Android 联动",
+    "type": "object",
+    "hint": "默认关闭。开启后会启动独立移动端网关，Android 可配对并获取通话房间、上报前台位置和屏幕共享状态。位置与会话只保留在内存中。请仅监听可信的组网地址。",
+    "items": {
+      "enabled": {
+        "description": "启用移动端网关",
+        "type": "bool",
+        "default": false
+      },
+      "pairing_token": {
+        "description": "移动端配对令牌",
+        "type": "string",
+        "default": "",
+        "hint": "请使用至少 24 位随机长令牌。配对成功后 App 会换用短期会话令牌。不要把令牌发布到群聊或截图中。",
+        "condition": {"enabled": true}
+      },
+      "host": {
+        "description": "移动端网关监听地址",
+        "type": "string",
+        "default": "0.0.0.0",
+        "hint": "0.0.0.0 可从所有网卡访问；更稳妥的做法是填写电脑在组网工具中的 100.x 地址。",
+        "condition": {"enabled": true}
+      },
+      "port": {
+        "description": "移动端网关端口",
+        "type": "int",
+        "default": 6322,
+        "hint": "Android 端 AstrBot 地址应填写为 http://电脑组网地址:此端口。",
+        "condition": {"enabled": true}
+      },
+      "allowed_user_id": {
+        "description": "绑定的 AstrBot 用户 ID",
+        "type": "string",
+        "default": "",
+        "hint": "留空时仅会在陪伴插件恰好返回一个授权用户时自动绑定；存在多个主要用户/管理员时必须显式填写，避免误绑定。",
+        "condition": {"enabled": true}
+      },
+      "session_ttl_hours": {
+        "description": "移动端会话有效期（小时）",
+        "type": "int",
+        "slider": {"min": 1, "max": 720, "step": 1},
+        "default": 168,
+        "hint": "会话只存在于内存，插件或 AstrBot 重启后仍需重新配对。",
+        "condition": {"enabled": true}
+      },
+      "location_ttl_seconds": {
+        "description": "位置上下文有效期（秒）",
+        "type": "int",
+        "slider": {"min": 60, "max": 86400, "step": 60},
+        "default": 900,
+        "condition": {"enabled": true}
+      },
+      "screen_upload_enabled": {
+        "description": "允许手机屏幕共享上报",
+        "type": "bool",
+        "default": true,
+        "hint": "仅控制移动端状态入口；Screen Companion 自身仍需开启远程识屏、设置 remote_auth_token，并由 Android 端单独输入该地址和令牌。",
+        "condition": {"enabled": true}
+      }
+    }
+  }
+}
