@@ -531,28 +531,35 @@ class RealityTouchCameraToolScopeTests(unittest.IsolatedAsyncioTestCase):
 class RealityTouchCameraCaptureTests(unittest.TestCase):
     def test_device_catalog_is_only_enumerated_on_explicit_refresh(self) -> None:
         harness = CameraHarness()
-        enumerate_calls = 0
+        probed_indexes: list[int] = []
+        released_indexes: list[int] = []
 
-        class CameraInfo:
-            index = 1400
-            name = "FHD Webcam"
+        class Capture:
+            def __init__(self, index: int) -> None:
+                self.index = index
 
-        def enumerate_cameras():
-            nonlocal enumerate_calls
-            enumerate_calls += 1
-            return [CameraInfo()]
+            def isOpened(self) -> bool:
+                return self.index == 2
 
-        fake_enumerator = types.SimpleNamespace(enumerate_cameras=enumerate_cameras)
-        fake_cv2 = types.SimpleNamespace(
-            videoio_registry=types.SimpleNamespace(getBackendName=lambda _code: "MSMF")
-        )
-        with patch.dict(sys.modules, {"cv2": fake_cv2, "cv2_enumerate_cameras": fake_enumerator}):
+            def getBackendName(self) -> str:
+                return "MSMF"
+
+            def release(self) -> None:
+                released_indexes.append(self.index)
+
+        def open_capture(index: int) -> Capture:
+            probed_indexes.append(index)
+            return Capture(index)
+
+        fake_cv2 = types.SimpleNamespace(VideoCapture=open_capture)
+        with patch.dict(sys.modules, {"cv2": fake_cv2}):
             self.assertEqual([], harness._reality_touch_camera_devices(refresh=False)["devices"])
-            self.assertEqual(0, enumerate_calls)
+            self.assertEqual([], probed_indexes)
             catalog = harness._reality_touch_camera_devices(refresh=True)
-        self.assertEqual(1, enumerate_calls)
-        self.assertEqual(1400, catalog["devices"][0]["index"])
-        self.assertEqual("FHD Webcam", catalog["devices"][0]["name"])
+        self.assertEqual(list(range(8)), probed_indexes)
+        self.assertEqual(list(range(8)), released_indexes)
+        self.assertEqual(2, catalog["devices"][0]["index"])
+        self.assertEqual("摄像头 2", catalog["devices"][0]["name"])
         self.assertEqual("MSMF", catalog["devices"][0]["backend"])
 
     def test_capture_reads_one_frame_and_always_releases_device(self) -> None:

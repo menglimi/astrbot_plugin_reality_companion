@@ -30,7 +30,7 @@ from .wakeup_alarm import WakeupAlarmMixin
 
 
 PLUGIN_NAME = "astrbot_plugin_reality_companion"
-PLUGIN_VERSION = "0.2.2"
+PLUGIN_VERSION = "0.2.3"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 _active_plugin: "RealityCompanionPlugin | None" = None
 _MISSING = object()

@@ -12,7 +12,7 @@
 C:\path\to\AstrBot\python\python.exe -m pip install -r requirements.txt
 ```
 
-OpenCV 只用于任务触发的单帧读取，不会持续录像；`sounddevice` 和 `soundfile` 用于将 TTS 音频发送到指定输出设备。
+OpenCV 只用于任务触发的单帧读取，不会持续录像。AstrBot Desktop 已自带 OpenCV，`requirements.txt` 不会再安装任何额外 `cv2` 包，避免 Windows 便携环境出现二进制扩展递归加载冲突；设备扫描会探测可打开的索引 0 到 7。`sounddevice` 和 `soundfile` 用于将 TTS 音频发送到指定输出设备。
 
 ## 授权边界
 

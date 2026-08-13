@@ -525,20 +525,13 @@ class RealityTouchCameraMixin:
     def _reality_touch_camera_backend_snapshot(cls) -> dict[str, Any]:
         try:
             cv2 = cls._reality_touch_import_cv2()
-
-            try:
-                import cv2_enumerate_cameras  # type: ignore  # noqa: F401
-                enumerator_available = True
-            except Exception:
-                enumerator_available = False
-
             version = _single_line(getattr(cv2, "__version__", ""), 40)
             return {
                 "available": True,
                 "backend": "opencv",
                 "version": version,
-                "enumerator_available": enumerator_available,
-                "error": "" if enumerator_available else "缺少摄像头名称枚举依赖，仍可手动填写索引",
+                "enumerator_available": True,
+                "error": "",
             }
         except Exception as exc:
             return {
@@ -546,11 +539,11 @@ class RealityTouchCameraMixin:
                 "backend": "unavailable",
                 "version": "",
                 "enumerator_available": False,
-                "error": "当前 AstrBot 运行环境缺少 OpenCV 摄像头依赖" + (f"：{_single_line(exc, 120)}" if exc else ""),
+                "error": "AstrBot 自带 OpenCV 加载失败或发生版本冲突" + (f"：{_single_line(exc, 120)}" if exc else ""),
             }
 
     def _reality_touch_camera_devices(self, *, refresh: bool = False) -> dict[str, Any]:
-        """Return a cached device catalog; enumerate only after an explicit page action."""
+        """Return a cached device catalog; probe indexes only after an explicit page action."""
         store_getter = getattr(self, "_reality_touch_store", None)
         store = store_getter() if callable(store_getter) else {}
         cached = store.get("camera_device_catalog") if isinstance(store, dict) else None
@@ -558,37 +551,37 @@ class RealityTouchCameraMixin:
             return dict(cached) if isinstance(cached, dict) else {"devices": [], "scanned_at": 0, "error": ""}
         try:
             cv2 = self._reality_touch_import_cv2()
-            from cv2_enumerate_cameras import enumerate_cameras  # type: ignore
-
             devices: list[dict[str, Any]] = []
-            seen: set[int] = set()
-            for info in enumerate_cameras():
-                index = _safe_int(getattr(info, "index", -1), -1, -1, 100000)
-                if index < 0 or index in seen:
-                    continue
-                seen.add(index)
-                api_code = (index // 100) * 100
-                backend_name = ""
-                registry = getattr(cv2, "videoio_registry", None)
-                backend_getter = getattr(registry, "getBackendName", None)
-                if callable(backend_getter) and api_code > 0:
-                    try:
-                        backend_name = _single_line(backend_getter(api_code), 40)
-                    except Exception:
-                        backend_name = ""
-                name = _single_line(getattr(info, "name", ""), 100) or f"摄像头 {index}"
-                devices.append(
-                    {
-                        "index": index,
-                        "name": name,
-                        "backend": backend_name,
-                        "virtual": any(marker in name.lower() for marker in ("virtual", "vtube", "obs")),
-                    }
-                )
+            for index in range(8):
+                capture = cv2.VideoCapture(index)
+                try:
+                    if not capture or not capture.isOpened():
+                        continue
+                    backend_name = ""
+                    backend_getter = getattr(capture, "getBackendName", None)
+                    if callable(backend_getter):
+                        try:
+                            backend_name = _single_line(backend_getter(), 40)
+                        except Exception:
+                            backend_name = ""
+                    devices.append(
+                        {
+                            "index": index,
+                            "name": f"摄像头 {index}",
+                            "backend": backend_name,
+                            "virtual": False,
+                        }
+                    )
+                finally:
+                    if capture:
+                        try:
+                            capture.release()
+                        except Exception:
+                            pass
             catalog = {
                 "devices": devices,
                 "scanned_at": _now_ts(),
-                "error": "" if devices else "没有枚举到摄像头设备",
+                "error": "" if devices else "没有检测到可打开的摄像头入口（已检查索引 0 到 7）",
             }
         except Exception as exc:
             catalog = {
@@ -726,11 +719,17 @@ class RealityTouchCameraMixin:
             elif food_visibility == "visible":
                 food_visibility = "uncertain"
             observation["food_visibility"] = food_visibility
+        # The scene summary is the primary handoff to the reply model.  Some
+        # vision providers occasionally omit purpose_answer while still
+        # returning a useful, grounded description and evidence.
+        has_grounded_visual_summary = bool(scene_description or evidence)
         answer_available = bool(
             observation["analyzed"]
             and observation["confidence"] > 0
-            and answer_status in {"answered", "not_visible"}
-            and purpose_answer
+            and (
+                (answer_status in {"answered", "not_visible"} and purpose_answer)
+                or has_grounded_visual_summary
+            )
         )
         if self._reality_touch_camera_food_request_matches(purpose):
             legacy_food_answer = bool(
@@ -996,7 +995,8 @@ class RealityTouchCameraMixin:
                     result["final_response_instruction"] = (
                         "摄像头已经取到一帧，但没有得到足够可靠的目标识别结果。"
                         "只能说明这帧未能判断出用户所问内容；不得改写成画面很黑、镜头被挡、又没看到，"
-                        "也不得猜测任何未出现在 observation 中的人物、物品或环境原因。"
+                        "也不得猜测任何未出现在 observation 中的人物、物品或环境原因；"
+                        "不要撒娇逼问、催促用户交代，也不要指责用户欺骗或拿失败结果开玩笑。"
                     )
                 if preview_data_url:
                     result["preview_data_url"] = preview_data_url

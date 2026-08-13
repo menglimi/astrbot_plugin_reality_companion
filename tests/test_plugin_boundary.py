@@ -29,9 +29,11 @@ def test_runtime_and_metadata_versions_match() -> None:
 def test_heavy_device_dependencies_live_only_in_reality_plugin() -> None:
     reality_requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     private_requirements = (PRIVATE_ROOT / "requirements.txt").read_text(encoding="utf-8")
-    for dependency in ("sounddevice", "soundfile", "opencv-python-headless", "cv2-enumerate-cameras"):
+    for dependency in ("sounddevice", "soundfile"):
         assert dependency in reality_requirements
         assert dependency not in private_requirements
+    assert "cv2-enumerate-cameras" not in reality_requirements
+    assert "opencv-python-headless" not in reality_requirements
 
 
 def test_schema_is_valid_utf8_json() -> None:
