@@ -25,6 +25,8 @@ OpenCV 只用于任务触发的单帧读取，不会持续录像。AstrBot Deskt
 
 本插件可选地提供独立移动端网关，供你自行维护的客户端接入，不随本插件 Release 分发应用程序或安装包。网关以配对令牌换取短期会话令牌，可提供 Together 房间链接、接收前台位置上下文、维护屏幕共享状态并支持撤销会话。
 
+已授权用户可在私聊发送 `现实触及 配对令牌` 查看当前令牌；尚未配置时会自动生成。发送 `现实触及 重置配对令牌` 会生成新令牌、清空已有移动端会话并重启网关。令牌不会在群聊中输出。
+
 1. 需要 Together 房间时先安装 Together Companion；需要屏幕共享状态时先安装 Screen Companion。
 2. 在本插件配置页打开 `mobile.enabled`，把 `mobile.host` 填为 AstrBot 电脑的组网 IP、`mobile.port` 保持 `6322`，设置至少 24 位随机 `pairing_token`，并把 `allowed_user_id` 填为实际使用者的 AstrBot 用户 ID。
 3. 保存后重启 AstrBot，使移动网关按新地址重新绑定。可从同一组网设备访问 `http://电脑组网IP:6322/health` 检查网关是否可达。

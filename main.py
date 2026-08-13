@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import zoneinfo
@@ -16,12 +17,13 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 
 try:
-    from quart import request
-except Exception:  # pragma: no cover - AstrBot runtime supplies Quart
+    from astrbot.api.web import request
+except Exception:  # pragma: no cover - allows isolated tests without AstrBot
     request = None
 
 from .helpers import _now_ts, _safe_int, _single_line
@@ -30,7 +32,7 @@ from .wakeup_alarm import WakeupAlarmMixin
 
 
 PLUGIN_NAME = "astrbot_plugin_reality_companion"
-PLUGIN_VERSION = "0.2.3"
+PLUGIN_VERSION = "0.2.4"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 _active_plugin: "RealityCompanionPlugin | None" = None
 _MISSING = object()
@@ -67,6 +69,54 @@ _LEGACY_CAMERA_CONFIG_KEYS: dict[str, str] = {
     "proactive_cooldown_minutes": "camera_proactive_cooldown_minutes",
 }
 _AUDIO_CONFIG_DEFAULTS: dict[str, Any] = {"default_playback_volume": 35}
+
+
+def _reality_touch_tool_name(tool: Any) -> str:
+    return _single_line(getattr(tool, "name", ""), 80)
+
+
+def _reality_touch_camera_tool_payload(tool_result: Any) -> dict[str, Any] | None:
+    """Read the camera receipt from AstrBot's CallToolResult or test-friendly forms."""
+    candidates: list[Any] = [tool_result]
+    if not isinstance(tool_result, (str, bytes, dict)):
+        candidates.extend(list(getattr(tool_result, "content", []) or []))
+        structured = getattr(tool_result, "structuredContent", None)
+        if structured is not None:
+            candidates.append(structured)
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            if "status" in candidate or "answer_available" in candidate:
+                return candidate
+            text = candidate.get("text")
+        elif isinstance(candidate, bytes):
+            text = candidate.decode("utf-8", errors="replace")
+        elif isinstance(candidate, str):
+            text = candidate
+        else:
+            text = getattr(candidate, "text", None)
+        if not isinstance(text, str):
+            continue
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(decoded, dict) and (
+            "status" in decoded or "answer_available" in decoded
+        ):
+            return decoded
+    return None
+
+
+def _reality_touch_camera_reply_needs_uncertain_fallback(text: str) -> bool:
+    """Only catch explanations and guesses forbidden by an uncertain camera receipt."""
+    return bool(
+        re.search(
+            r"(?:画面.{0,5}(?:黑|糊|模糊)|镜头.{0,5}(?:挡|遮)|看错了?|"
+            r"(?:又在)?吃(?:什么)?(?:不健康|东西)|老实交代|快点.{0,6}交代|"
+            r"你(?:刚才)?给我看了什么)",
+            str(text or ""),
+        )
+    )
 
 
 def get_reality_companion_api() -> Any | None:
@@ -657,6 +707,19 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         text = "".join(str(getattr(item, "text", "") or "") for item in components)
         return bool(await sender(umo, text))
 
+    async def _record_reality_touch_delivery(self, user: dict[str, Any], text: str, *, source: str) -> bool:
+        user_id = _single_line(user.get("user_id"), 120) if isinstance(user, dict) else ""
+        api = self._private_companion_api()
+        recorder = getattr(api, "record_reality_touch_output", None) if api is not None else None
+        if not user_id or not callable(recorder):
+            return False
+        try:
+            result = await recorder(user_id, text, source=source, delivered_at=_now_ts())
+        except Exception as exc:
+            logger.warning("[RealityCompanion] 现实触及输出回写失败: %s", _single_line(exc, 160))
+            return False
+        return bool(isinstance(result, dict) and result.get("recorded"))
+
     async def _reply(self, event: AstrMessageEvent, text: str) -> None:
         sender = getattr(event, "send", None)
         if callable(sender):
@@ -698,6 +761,13 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             return
         raw = str(getattr(event, "message_str", "") or "")
         value = re.sub(r"^\s*/?(?:现实触及|来到身边)\s*", "", raw, count=1).strip()
+        pairing_action = re.sub(r"[\s，,。.!！;；:：]+", "", value)
+        if pairing_action in {"配对令牌", "查看配对令牌", "输出配对令牌", "生成配对令牌"}:
+            yield event.plain_result(await self._mobile_pairing_token_command(rotate=False))
+            return
+        if pairing_action in {"重置配对令牌", "重新生成配对令牌", "刷新配对令牌"}:
+            yield event.plain_result(await self._mobile_pairing_token_command(rotate=True))
+            return
         user = self._user(user_id)
         user["umo"] = _single_line(getattr(event, "unified_msg_origin", ""), 180)
         response, followup = self._wakeup_alarm_command(user, value)
@@ -719,6 +789,30 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         elif followup:
             self._create_lifecycle_background_task(self._test_wakeup_alarm(user), label="wakeup_test")
 
+    async def _mobile_pairing_token_command(self, *, rotate: bool) -> str:
+        token = self._mobile_pairing_token()
+        generated = rotate or not token
+        if generated:
+            token = secrets.token_urlsafe(32)
+            self._set_group_config_field("mobile", "pairing_token", token)
+            saver = getattr(self.config, "save_config", None)
+            if callable(saver):
+                saver()
+            await self._stop_mobile_server()
+            await self._start_mobile_server()
+
+        state = "已重置" if rotate else ("已生成" if generated else "当前")
+        gateway = (
+            f"{self._mobile_host()}:{self._mobile_server_bound_port or self._mobile_port()}"
+            if self._mobile_enabled()
+            else "移动端网关尚未启用"
+        )
+        return (
+            f"Android 配对令牌（{state}）：\n{token}\n"
+            f"网关：{gateway}\n"
+            "该令牌可用于建立新的移动端会话，请勿转发、截图或发送到群聊。"
+        )
+
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=221000)
     async def capture_private_identity_and_confirmation(self, event: AstrMessageEvent):
         text = str(getattr(event, "message_str", "") or "").strip()
@@ -729,6 +823,7 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         if user is None:
             return
         user["umo"] = _single_line(getattr(event, "unified_msg_origin", ""), 180)
+        user["last_private_activity_at"] = _now_ts()
         self._schedule_data_save()
         confirmation = self._reality_touch_apply_pending_confirmation(user, text)
         if confirmation:
@@ -770,7 +865,8 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
                     "same_turn_retry_allowed": False,
                     "final_response_instruction": (
                         "本次摄像头工具没有获得任何可用画面。必须如实说明失败原因；"
-                        "不得声称画面黑、镜头被挡、又没看到、看到了人物或物品，也不得猜测用户当前状态。"
+                        "不得声称画面黑、镜头被挡、又没看到、看到了人物或物品，也不得猜测用户当前状态；"
+                        "不要撒娇逼问、催促用户交代，也不要指责用户欺骗或拿失败结果开玩笑。"
                     ),
                 },
                 ensure_ascii=False,
@@ -834,11 +930,13 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             if not result.get("final_response_instruction"):
                 result["final_response_instruction"] = (
                     "摄像头已经取得一帧，但视觉模型没有可靠回答本次问题。只能说明无法判断；"
-                    "不得把不确定改写成画面黑、镜头被挡，也不得补充 observation 中没有的细节。"
+                    "不得把不确定改写成画面黑、镜头被挡，也不得补充 observation 中没有的细节；"
+                    "不要撒娇逼问、催促用户交代，也不要指责用户欺骗或拿失败结果开玩笑。"
                     if captured
                     else (
                         "本次摄像头工具没有获得任何可用画面。必须如实转述工具返回的失败原因；"
-                        "不得声称画面黑、镜头被挡、又没看到、看到了人物或物品，也不得猜测用户当前状态。"
+                        "不得声称画面黑、镜头被挡、又没看到、看到了人物或物品，也不得猜测用户当前状态；"
+                        "不要撒娇逼问、催促用户交代，也不要指责用户欺骗或拿失败结果开玩笑。"
                     )
                 )
         return json.dumps(result, ensure_ascii=False)
@@ -902,7 +1000,10 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             + "应先调用 pc_reality_touch_camera_snapshot，再优先依据 observation.purpose_answer、scene_description 和 visible_evidence 自然回答。"
             + "unknown/uncertain 只表示无法判断，不能解释成画面黑或镜头被挡。"
             + "最终回复只能陈述 observation 明确出现的内容；不得从当前时间、侧卧/抬手等姿势动作或房间物品推断"
-            + "睡不着、锻炼、情绪、意图或其他未出现事实。不要在工具失败时猜测画面或说成‘又没看到’。"
+            + "睡不着、锻炼、情绪、意图或其他未出现事实。工具失败或无法判断时，只简短说明本次结果；"
+            + "当工具返回 observation_uncertain 或 answer_available=false 时，最终只回复一句‘本次未能可靠判断’，"
+            + "不解释原因、不换话题猜食物或其他内容，也不追问用户。"
+            + "不要在工具失败时猜测画面或说成‘又没看到’，也不要撒娇逼问、催促用户交代或指责用户欺骗。"
         )
         req.system_prompt = f"{current}\n\n{marker}\n{guidance}".strip()
         recorder = getattr(self, "_record_request_prompt_fragment", None)
@@ -932,6 +1033,53 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         **kwargs: Any,
     ) -> None:
         await self._record_official_reality_touch_tool_result(event, tool, tool_result)
+        if _reality_touch_tool_name(tool) != "pc_reality_touch_camera_snapshot":
+            return
+        payload = _reality_touch_camera_tool_payload(tool_result)
+        if not isinstance(payload, dict):
+            return
+        status = _single_line(payload.get("status"), 40).lower()
+        answer_available = payload.get("answer_available")
+        uncertain = status != "success" or answer_available is False
+        setattr(event, "_reality_touch_camera_answer_uncertain", uncertain)
+        if uncertain:
+            logger.info(
+                "[RealityCompanion] 摄像头工具未给出可靠答案，已标记发送前事实校验: status=%s answer_available=%s",
+                status or "unknown",
+                answer_available,
+            )
+
+    @filter.on_decorating_result(priority=400)
+    async def enforce_uncertain_camera_reply_contract(
+        self,
+        event: AstrMessageEvent,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Prevent a reply model from inventing a camera explanation after an uncertain result."""
+        if not bool(getattr(event, "_reality_touch_camera_answer_uncertain", False)):
+            return
+        try:
+            result = event.get_result()
+        except Exception:
+            return
+        chain = list(getattr(result, "chain", []) or []) if result is not None else []
+        text = "".join(
+            str(getattr(component, "text", "") or "")
+            for component in chain
+            if isinstance(component, Plain)
+        ).strip()
+        if not text or not _reality_touch_camera_reply_needs_uncertain_fallback(text):
+            return
+        replacement = "这次单帧没能可靠判断你在给我看什么，我先不乱猜。"
+        try:
+            result.chain = [Plain(replacement)]
+        except Exception:
+            event.set_result(event.plain_result(replacement))
+        logger.warning(
+            "[RealityCompanion] 已替换不确定摄像头结果后的无依据回复: session=%s",
+            _single_line(getattr(event, "unified_msg_origin", ""), 120) or "unknown",
+        )
 
     @filter.on_agent_done()
     async def complete_reality_touch_job(
@@ -957,8 +1105,8 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
 
     async def page_action(self) -> dict[str, Any]:
         if request is None:
-            return {"ok": False, "message": "Quart 请求上下文不可用"}
-        payload = await request.get_json(silent=True) or {}
+            return {"ok": False, "message": "AstrBot 页面请求上下文不可用"}
+        payload = await request.json(default={}) or {}
         return await self._perform_page_action(payload)
 
     async def _perform_page_action(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -966,6 +1114,8 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         try:
             if action in {"scan_camera", "scan_cameras"}:
                 result = self._reality_touch_scan_camera_devices()
+            elif action in {"save_global_config", "save_config"}:
+                result = await self._reality_touch_save_global_config(payload)
             elif action in {"select_audio", "select_output"}:
                 result = self._reality_touch_select_audio_device(
                     _single_line(payload.get("device_id"), 96),
@@ -983,7 +1133,10 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
                 self.reality_touch_camera_proactive_max_daily = _safe_int(payload.get("proactive_max_daily"), 1, 0, 10)
                 self.reality_touch_camera_proactive_cooldown_minutes = _safe_int(payload.get("proactive_cooldown_minutes"), 240, 10, 1440)
                 result = {"saved": self._save_runtime_camera_config()}
-            elif action in {"test_audio", "test"} and _single_line(payload.get("test_kind"), 24).lower() == "device":
+            elif action in {"test_audio", "test"} and (
+                action == "test_audio"
+                or _single_line(payload.get("test_kind"), 24).lower() == "device"
+            ):
                 result = {"played": await self._play_reality_touch_test_audio(payload.get("playback_volume"))}
             elif action == "test_camera":
                 user_id = _single_line(payload.get("user_id"), 120)
@@ -1061,6 +1214,78 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
                     "ephemeral": True,
                 }
         return {"ok": True, "result": result, "data": snapshot}
+
+    def _reality_touch_configuration_snapshot(self) -> dict[str, Any]:
+        """Return editable settings without exposing the mobile pairing secret."""
+        return {
+            "enabled": bool(self.enable_experimental_bluetooth_wakeup),
+            "vision_provider_id": _single_line(self.plugin_vision_provider_id, 160),
+            "timezone": _single_line(self.environment_perception_timezone, 80) or "Asia/Shanghai",
+            "authorized_user_ids": sorted(self.authorized_user_ids),
+            "audio_default_playback_volume": _safe_int(self.tts_local_playback_volume, 35, 0, 100),
+            "mobile": {
+                "enabled": self._mobile_enabled(),
+                "host": self._mobile_host(),
+                "port": self._mobile_port(),
+                "allowed_user_id": self._mobile_allowed_user_id(),
+                "session_ttl_hours": self._cfg_int("mobile.session_ttl_hours", 168, 1, 720),
+                "location_ttl_seconds": self._mobile_location_ttl(),
+                "screen_upload_enabled": self._mobile_screen_upload_enabled(),
+                "pairing_token_configured": bool(self._mobile_pairing_token()),
+                "running": self._mobile_server_runner is not None,
+                "bound_port": _safe_int(self._mobile_server_bound_port, 0, 0, 65535),
+            },
+        }
+
+    async def _reality_touch_save_global_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        enabled = self._coerce_config_bool(payload.get("enabled"), False)
+        vision_provider_id = _single_line(payload.get("vision_provider_id"), 160)
+        timezone = _single_line(payload.get("timezone"), 80) or "Asia/Shanghai"
+        raw_ids = payload.get("authorized_user_ids", [])
+        if isinstance(raw_ids, str):
+            raw_ids = re.split(r"[,\n，；;]+", raw_ids)
+        authorized_user_ids = sorted({
+            _single_line(item, 120)
+            for item in (raw_ids if isinstance(raw_ids, (list, tuple, set)) else [])
+            if _single_line(item, 120)
+        })
+
+        self.config["enabled"] = enabled
+        self.config["vision_provider_id"] = vision_provider_id
+        self.config["timezone"] = timezone
+        self.config["authorized_user_ids"] = authorized_user_ids
+        self._set_group_config_field(
+            "audio",
+            "default_playback_volume",
+            _safe_int(payload.get("audio_default_playback_volume"), 35, 0, 100),
+        )
+
+        mobile = payload.get("mobile") if isinstance(payload.get("mobile"), dict) else {}
+        mobile_values = {
+            "enabled": self._coerce_config_bool(mobile.get("enabled"), False),
+            "host": _single_line(mobile.get("host"), 120) or "0.0.0.0",
+            "port": _safe_int(mobile.get("port"), 6322, 1, 65535),
+            "allowed_user_id": _single_line(mobile.get("allowed_user_id"), 120),
+            "session_ttl_hours": _safe_int(mobile.get("session_ttl_hours"), 168, 1, 720),
+            "location_ttl_seconds": _safe_int(mobile.get("location_ttl_seconds"), 900, 60, 86400),
+            "screen_upload_enabled": self._coerce_config_bool(mobile.get("screen_upload_enabled"), True),
+        }
+        for key, value in mobile_values.items():
+            self._set_group_config_field("mobile", key, value)
+        pairing_token = _single_line(mobile.get("pairing_token"), 240)
+        if pairing_token:
+            self._set_group_config_field("mobile", "pairing_token", pairing_token)
+
+        saver = getattr(self.config, "save_config", None)
+        if callable(saver):
+            saver()
+        self._sync_runtime_config()
+        self.plugin_vision_provider_id = vision_provider_id
+        self.environment_perception_timezone = timezone
+        self.authorized_user_ids = set(authorized_user_ids)
+        await self._stop_mobile_server()
+        await self._start_mobile_server()
+        return {"saved": True, "mobile_running": self._mobile_server_runner is not None}
 
     def _save_runtime_camera_config(self) -> bool:
         camera = self.config.get("camera") if isinstance(self.config, dict) else None

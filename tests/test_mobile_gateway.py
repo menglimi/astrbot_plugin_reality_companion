@@ -88,12 +88,40 @@ def test_mobile_location_is_coarsened_and_expires() -> None:
     assert harness.mobile_context("owner-1")["available"] is False
 
 
+def test_explicit_place_is_exposed_as_structured_environment_context() -> None:
+    harness = GatewayHarness()
+    now = time.time()
+    harness._mobile_locations["owner-1"] = {
+        "latitude": 31.230416,
+        "longitude": 121.473701,
+        "accuracy_m": 23.456,
+        "captured_at": now,
+        "received_at": now,
+        "place": {
+            "matched": True,
+            "name": "公司",
+            "kind": "work",
+            "distance_m": 18.4,
+            "radius_m": 180,
+        },
+    }
+    place = harness.mobile_context("owner-1")["location"]["place"]
+    assert place == {
+        "matched": True,
+        "name": "公司",
+        "kind": "work",
+        "distance_m": 18.0,
+        "radius_m": 180.0,
+    }
+
+
 def test_mobile_api_registers_only_device_routes() -> None:
     harness = GatewayHarness()
     harness._register_mobile_api()
     paths = {item[0] for item in harness.routes}
     assert "/astrbot_plugin_reality_companion/mobile/pair" in paths
     assert "/astrbot_plugin_reality_companion/mobile/location" in paths
+    assert "/astrbot_plugin_reality_companion/mobile/room/prepare" in paths
     assert "/astrbot_plugin_reality_companion/mobile/session/close" in paths
     assert all("settings" not in path for path in paths)
     assert len({item[1].__name__ for item in harness.routes}) == len(harness.routes)
@@ -191,6 +219,61 @@ def test_mobile_context_stops_exposing_location_when_gateway_is_disabled() -> No
     assert context["location"]["reason"] == "mobile_gateway_disabled"
 
 
+def test_status_requires_enabled_together_and_chat_provider_for_rooms() -> None:
+    harness = GatewayHarness()
+
+    class FakeTogether:
+        @staticmethod
+        async def page_status():
+            return {
+                "data": {
+                    "enabled": True,
+                    "running": True,
+                    "base_url": "http://127.0.0.1:6321",
+                    "capabilities": {
+                        "chat": {"available": False, "label": "未配置"},
+                        "work": {"available": True, "label": "屏幕伙伴已连接"},
+                    },
+                }
+            }
+
+    harness._mobile_find_plugin = lambda name: FakeTogether()
+    body = asyncio.run(harness._mobile_status_response({"user_id": "owner-1"}))
+
+    assert body["data"]["capabilities"]["room"] is False
+    assert body["data"]["capabilities"]["call"] is False
+    assert body["data"]["capabilities"]["work"] is False
+    assert body["data"]["together"]["blockers"] == ["未配置实时共处对话模型"]
+
+
+def test_status_exposes_each_ready_room_mode() -> None:
+    harness = GatewayHarness()
+
+    class FakeTogether:
+        @staticmethod
+        async def page_status():
+            return {
+                "data": {
+                    "enabled": True,
+                    "running": True,
+                    "base_url": "https://together.example.com",
+                    "capabilities": {
+                        "chat": {"available": True, "label": "chat"},
+                        "work": {"available": False, "label": ""},
+                    },
+                }
+            }
+
+    harness._mobile_find_plugin = lambda name: FakeTogether()
+    body = asyncio.run(harness._mobile_status_response({"user_id": "owner-1"}))
+
+    assert body["data"]["capabilities"]["room"] is True
+    assert body["data"]["capabilities"]["call"] is True
+    assert body["data"]["capabilities"]["watch"] is True
+    assert body["data"]["capabilities"]["work"] is False
+    assert body["data"]["together"]["blockers"] == []
+
+
 def test_call_room_prepares_secure_access_before_issuing_ticket() -> None:
     harness = GatewayHarness()
     events: list[str] = []
@@ -284,6 +367,51 @@ def test_independent_aiohttp_gateway_pairs_and_preserves_http_status() -> None:
                 ) as response:
                     assert response.status == 200
                     assert (await response.json())["data"]["paired"] is True
+
+                async with client.post(
+                    f"{base}/location",
+                    headers={"X-Companion-Mobile-Token": session},
+                    json={
+                        "latitude": 31.230416,
+                        "longitude": 121.473701,
+                        "accuracy_m": 23.4,
+                        "captured_at": int(time.time() * 1000),
+                        "label": "在公园",
+                    },
+                ) as response:
+                    assert response.status == 200
+                    location = (await response.json())["data"]
+                    assert location["available"] is True
+                    assert location["latitude"] == 31.23
+                    assert location["longitude"] == 121.474
+
+                async with client.get(
+                    f"{base}/status",
+                    headers={"X-Companion-Mobile-Token": session},
+                ) as response:
+                    status_data = (await response.json())["data"]
+                    assert status_data["location"]["available"] is True
+
+                async with client.post(
+                    f"{base}/location/revoke",
+                    headers={"X-Companion-Mobile-Token": session},
+                    json={},
+                ) as response:
+                    assert response.status == 200
+                    assert (await response.json())["data"]["revoked"] is True
+
+                async with client.post(
+                    f"{base}/session/close",
+                    headers={"X-Companion-Mobile-Token": session},
+                    json={},
+                ) as response:
+                    assert response.status == 200
+
+                async with client.get(
+                    f"{base}/status",
+                    headers={"X-Companion-Mobile-Token": session},
+                ) as response:
+                    assert response.status == 401
         finally:
             await harness._stop_mobile_server()
         assert harness._mobile_sessions == {}

@@ -451,6 +451,10 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
                 fade_in_ms=fade_in_ms,
                 source="official_reminder",
             )
+            if audio_success:
+                recorder = getattr(self, "_record_reality_touch_delivery", None)
+                if callable(recorder):
+                    await recorder(user_snapshot, reminder_text, source="official_reminder")
         delivery_mode = self._wakeup_delivery_mode(reminder_snapshot)
         chat_success = False
         if delivery_mode == "audio_and_chat" or (delivery_mode == "chat_on_failure" and not audio_success):
@@ -736,6 +740,8 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
 
     def _reality_touch_page_snapshot(self) -> dict[str, Any]:
         users = self.data.get("users", {}) if isinstance(getattr(self, "data", None), dict) else {}
+        configuration_getter = getattr(self, "_reality_touch_configuration_snapshot", None)
+        configuration = configuration_getter() if callable(configuration_getter) else {}
         now = self._wakeup_now()
         rows = [
             self._reality_touch_user_snapshot(str(user_id), user, now=now)
@@ -775,6 +781,7 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
             "dynamic_message_hint": self._WAKEUP_DYNAMIC_MESSAGE_HINT,
             "audio_output": self._reality_touch_audio_snapshot(),
             "camera": self._reality_touch_camera_page_snapshot(),
+            "configuration": configuration,
             "counts": {
                 "users": len(rows),
                 "consented": consented,
@@ -1104,6 +1111,10 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
             playback_kwargs["volume"] = volume
         played = await self._play_reality_touch_text(message, **playback_kwargs)
         if played:
+            if not test:
+                recorder = getattr(self, "_record_reality_touch_delivery", None)
+                if callable(recorder):
+                    await recorder(user, message, source="wakeup_alarm")
             logger.info("[PrivateCompanion] 起床提醒场景已播放: test=%s repeat=%s", test, repeat)
         return played
 
@@ -1178,6 +1189,10 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
                 fade_in_ms=_safe_int(alarm.get("fade_in_ms"), 800, 0, 5000),
                 source="wakeup_alarm",
             )
+            if played:
+                recorder = getattr(self, "_record_reality_touch_delivery", None)
+                if callable(recorder):
+                    await recorder(user, message, source="wakeup_alarm")
             delivery_mode = self._wakeup_delivery_mode(alarm)
             chat_sent = False
             if delivery_mode == "audio_and_chat" or (delivery_mode == "chat_on_failure" and not played):
@@ -1225,7 +1240,10 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
             r"(?:好|好啦|嗯|恩)?(?:我)?(?:已经)?(?:醒了|醒啦|起了|起来了|起床了)(?:呀|啊|哦|呢|哈|谢谢)?",
             compact,
         )
-        if explicit_awake or compact in {"不用叫了", "别叫了我醒了", "不用提醒了我醒了"}:
+        if explicit_awake or compact in {
+            "早", "早安", "早上好", "早啊", "早呀",
+            "不用叫了", "别叫了我醒了", "不用提醒了我醒了",
+        }:
             return "awake", 0
 
         llm_call = getattr(self, "_llm_call", None)
@@ -1324,7 +1342,6 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
         if not isinstance(users, dict):
             return
         now = self._wakeup_now()
-        minute_key = now.strftime("%Y-%m-%d %H:%M")
         check_window = max(90, _safe_int(getattr(self, "check_interval_seconds", 60), 60, 30) + 15)
         for user_id, user in list(users.items()):
             if not isinstance(user, dict) or not user.get("umo"):
@@ -1354,10 +1371,20 @@ class WakeupAlarmMixin(RealityTouchCameraMixin, RealityTouchAudioMixin):
             if not 0 <= (now - scheduled_at).total_seconds() <= check_window:
                 continue
             days = self._wakeup_days(alarm.get("days")) or list(range(7))
-            if now.weekday() not in days or alarm.get("last_trigger_key") == minute_key:
+            scheduled_key = scheduled_at.strftime("%Y-%m-%d %H:%M")
+            if now.weekday() not in days or alarm.get("last_trigger_key") == scheduled_key:
                 continue
-            alarm["last_trigger_key"] = minute_key
-            session_id = f"{user_id}:{now.strftime('%Y%m%d%H%M')}"
+            last_activity_at = _safe_int(user.get("last_private_activity_at"), 0, 0)
+            if last_activity_at >= int(scheduled_at.timestamp()):
+                alarm["last_trigger_key"] = scheduled_key
+                alarm["last_skip_reason"] = "user_active_after_scheduled_time"
+                alarm["last_skipped_at"] = _now_ts()
+                self._schedule_data_save(delay=0.2)
+                continue
+            alarm["last_trigger_key"] = scheduled_key
+            alarm.pop("last_skip_reason", None)
+            alarm.pop("last_skipped_at", None)
+            session_id = f"{user_id}:{scheduled_at.strftime('%Y%m%d%H%M')}"
             alarm["contact_session"] = {
                 "id": session_id,
                 "status": "pending",

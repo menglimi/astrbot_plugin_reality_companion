@@ -311,6 +311,14 @@ class MobileGatewayMixin:
         retention_age = max(0, int(time.time() - received_at)) if received_at else 0
         if not captured_at or not received_at or retention_age > self._mobile_location_ttl():
             return {"available": False, "reason": "location_expired", "age_seconds": age}
+        place = item.get("place") if isinstance(item.get("place"), dict) else {}
+        prompt_place = {
+            "matched": bool(place.get("matched")),
+            "name": _clean(place.get("name"), 40),
+            "kind": _clean(place.get("kind"), 24),
+            "distance_m": round(max(0.0, _number(place.get("distance_m"))), 0),
+            "radius_m": round(max(0.0, _number(place.get("radius_m"))), 0),
+        }
         return {
             "available": True,
             "latitude": round(_number(item.get("latitude")), 3),
@@ -322,6 +330,9 @@ class MobileGatewayMixin:
             # Device-provided free text is useful in the app status but must not
             # become a higher-trust prompt instruction in Private Companion.
             "label": "" if prompt_safe else _clean(item.get("label"), 40),
+            # Explicitly saved places are trusted only as environmental facts,
+            # never as instructions supplied by the device.
+            "place": prompt_place,
             "captured_at": captured_at,
             "age_seconds": age,
             "source": "android_foreground_location",
@@ -374,12 +385,43 @@ class MobileGatewayMixin:
                 data = result.get("data") if isinstance(result, dict) else {}
                 together_status = {
                     "available": True,
+                    "enabled": bool(isinstance(data, dict) and data.get("enabled")),
                     "running": bool(isinstance(data, dict) and data.get("running")),
                     "base_url": _clean(data.get("base_url"), 300) if isinstance(data, dict) else "",
                     "capabilities": data.get("capabilities", {}) if isinstance(data, dict) else {},
+                    "tunnel": data.get("tunnel", {}) if isinstance(data, dict) else {},
                 }
             except Exception as exc:
                 together_status = {"available": True, "running": False, "message": _clean(exc, 160)}
+        together_capabilities = (
+            together_status.get("capabilities")
+            if isinstance(together_status.get("capabilities"), dict)
+            else {}
+        )
+        chat_capability = (
+            together_capabilities.get("chat")
+            if isinstance(together_capabilities.get("chat"), dict)
+            else {}
+        )
+        work_capability = (
+            together_capabilities.get("work")
+            if isinstance(together_capabilities.get("work"), dict)
+            else {}
+        )
+        room_ready = bool(
+            together_status.get("available")
+            and together_status.get("enabled")
+            and chat_capability.get("available")
+        )
+        room_blockers: list[str] = []
+        if not together_status.get("available"):
+            room_blockers.append("未安装或未加载一起房间插件")
+        elif not together_status.get("enabled"):
+            room_blockers.append("一起房间服务未启用")
+        if together_status.get("available") and not chat_capability.get("available"):
+            room_blockers.append("未配置实时共处对话模型")
+        together_status["ready"] = room_ready
+        together_status["blockers"] = room_blockers
         return {
             "ok": True,
             "data": {
@@ -391,7 +433,10 @@ class MobileGatewayMixin:
                 "screen": self._mobile_screen_status(user_id),
                 "together": together_status,
                 "capabilities": {
-                    "room": bool(together_status.get("available")),
+                    "room": room_ready,
+                    "call": room_ready,
+                    "watch": room_ready,
+                    "work": room_ready and bool(work_capability.get("available")),
                     "location": True,
                     "screen_upload": self._mobile_screen_upload_enabled(),
                 },
@@ -495,7 +540,7 @@ class MobileGatewayMixin:
             if callable(revoker):
                 revoker(ticket)
             return self._mobile_json_error(
-                "视频通话需要 HTTPS 安全地址，否则 Android WebView 无法使用摄像头和麦克风",
+                "视频通话需要 HTTPS 安全地址，才能由手机浏览器安全申请摄像头和麦克风",
                 409,
             )
         return {
@@ -506,6 +551,26 @@ class MobileGatewayMixin:
                 "expires_at": ticket.expires_at,
             },
         }, 200
+
+    async def mobile_prepare_rooms(self) -> tuple[dict[str, Any], int]:
+        """Warm mobile HTTPS room access without issuing a room ticket."""
+        auth = self._mobile_authorize()
+        if not auth:
+            return self._mobile_json_error("未授权的移动端请求", 401)
+        together = self._mobile_find_plugin("astrbot_plugin_together_companion")
+        if together is None:
+            return self._mobile_json_error("未安装或未加载一起房间插件", 503)
+        if together._get_chat_provider() is None:
+            return self._mobile_json_error("一起房间尚未配置实时对话模型", 409)
+        access_preparer = getattr(together, "_ensure_mobile_room_access", None)
+        if not callable(access_preparer):
+            return self._mobile_json_error("一起房间插件版本过旧，缺少手机安全访问能力", 503)
+        async with self._mobile_room_start_lock:
+            try:
+                access = await access_preparer()
+            except Exception as exc:
+                return self._mobile_json_error(f"共同房间预热失败：{_clean(exc, 180)}", 503)
+        return {"ok": True, "data": {"ready": bool(access.get("tunnel_ready", False)) if isinstance(access, dict) else True}}, 200
 
     def _mobile_rewrite_room_url(self, room_url: str) -> str:
         """Replace loopback room hosts with the host used by the mobile request."""
@@ -548,6 +613,14 @@ class MobileGatewayMixin:
         altitude = _number(payload.get("altitude_m")) if payload.get("altitude_m") is not None else None
         speed = _number(payload.get("speed_mps"), 0.0)
         bearing = _number(payload.get("bearing")) if payload.get("bearing") is not None else None
+        raw_place = payload.get("place") if isinstance(payload.get("place"), dict) else {}
+        place = {
+            "matched": bool(raw_place.get("matched")),
+            "name": _clean(raw_place.get("name"), 40),
+            "kind": _clean(raw_place.get("kind"), 24),
+            "distance_m": max(0.0, min(100_000.0, _number(raw_place.get("distance_m")))),
+            "radius_m": max(20.0, min(5_000.0, _number(raw_place.get("radius_m"), 150.0))),
+        }
         item = {
             "latitude": latitude,
             "longitude": longitude,
@@ -556,6 +629,7 @@ class MobileGatewayMixin:
             "speed_mps": max(0.0, min(1000.0, speed)) if math.isfinite(speed) else 0.0,
             "bearing": bearing % 360.0 if bearing is not None and math.isfinite(bearing) else None,
             "label": _clean(payload.get("label"), 40),
+            "place": place,
             "captured_at": captured_at,
             "received_at": now,
         }
@@ -686,6 +760,7 @@ class MobileGatewayMixin:
             ("POST", "/pair", self.mobile_pair),
             ("GET", "/status", self.mobile_status),
             ("POST", "/room/create", self.mobile_create_room),
+            ("POST", "/room/prepare", self.mobile_prepare_rooms),
             ("POST", "/location", self.mobile_location),
             ("POST", "/location/revoke", self.mobile_revoke_location),
             ("POST", "/screen/heartbeat", self.mobile_screen_heartbeat),
@@ -782,6 +857,7 @@ class MobileGatewayMixin:
         register_api(f"{prefix}/pair", route(self.mobile_pair), ["POST"], "Reality Companion mobile pair")
         register_api(f"{prefix}/status", route(self.mobile_status), ["GET"], "Reality Companion mobile status")
         register_api(f"{prefix}/room/create", route(self.mobile_create_room), ["POST"], "Reality Companion mobile room")
+        register_api(f"{prefix}/room/prepare", route(self.mobile_prepare_rooms), ["POST"], "Reality Companion warm mobile room")
         register_api(f"{prefix}/location", route(self.mobile_location), ["POST"], "Reality Companion mobile location")
         register_api(f"{prefix}/location/revoke", route(self.mobile_revoke_location), ["POST"], "Reality Companion revoke mobile location")
         register_api(f"{prefix}/screen/heartbeat", route(self.mobile_screen_heartbeat), ["POST"], "Reality Companion mobile screen status")

@@ -121,9 +121,14 @@ class ContactSessionHarness(DynamicAlarmHarness):
                 }
             }
         }
+        self.recorded_deliveries: list[dict] = []
 
     def _schedule_data_save(self, **kwargs) -> None:
         return None
+
+    async def _record_reality_touch_delivery(self, user, text: str, *, source: str) -> bool:
+        self.recorded_deliveries.append({"user": user, "text": text, "source": source})
+        return True
 
 
 class _FeedbackEvent:
@@ -406,6 +411,8 @@ class WakeupAlarmTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session["last_playback_success"])
         self.assertEqual("wakeup_alarm", harness.audio_calls[0]["source"])
         self.assertEqual(600, harness.audio_calls[0]["fade_in_ms"])
+        self.assertEqual(1, len(harness.recorded_deliveries))
+        self.assertEqual(harness.llm_result, harness.recorded_deliveries[0]["text"])
 
     async def test_tick_is_idempotent_for_one_minute(self) -> None:
         harness = AlarmHarness()
@@ -416,6 +423,22 @@ class WakeupAlarmTests(unittest.IsolatedAsyncioTestCase):
         await harness._run_wakeup_alarm_tick()
         await harness._run_wakeup_alarm_tick()
         self.assertEqual(1, harness.played)
+
+    async def test_late_tick_skips_alarm_when_user_was_active_after_scheduled_time(self) -> None:
+        harness = AlarmHarness()
+        user = harness.data["users"]["u"]
+        harness._wakeup_alarm_command(user, f"确认 {harness._REALITY_TOUCH_CONFIRMATION_TEXT}")
+        harness._wakeup_alarm_command(user, "07:30")
+        scheduled = datetime(2026, 8, 10, 7, 30).astimezone()
+        user["last_private_activity_at"] = int(scheduled.timestamp()) + 20
+        harness.check_interval_seconds = 300
+        harness._wakeup_now = lambda: scheduled.replace(minute=34)
+
+        await harness._run_wakeup_alarm_tick()
+
+        self.assertEqual(0, harness.played)
+        self.assertEqual("2026-08-10 07:30", user["wakeup_alarm"]["last_trigger_key"])
+        self.assertEqual("user_active_after_scheduled_time", user["wakeup_alarm"]["last_skip_reason"])
 
     async def test_tick_requires_current_consent(self) -> None:
         harness = AlarmHarness()
@@ -451,6 +474,24 @@ class WakeupAlarmTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         self.assertEqual("acknowledged", user["wakeup_alarm"]["contact_session"]["status"])
         self.assertIn("已经醒来", harness.replies[-1])
+
+    async def test_morning_greeting_stops_pending_contact_session_without_llm(self) -> None:
+        harness = AlarmHarness()
+        user = harness.data["users"]["u"]
+        user["wakeup_alarm"] = {
+            "enabled": True,
+            "contact_session": {
+                "id": "u:202608100730",
+                "status": "pending",
+                "attempt": 1,
+                "max_attempts": 3,
+            },
+        }
+
+        handled = await harness._maybe_handle_wakeup_feedback(_FeedbackEvent(), "u", user, "早")
+
+        self.assertTrue(handled)
+        self.assertEqual("acknowledged", user["wakeup_alarm"]["contact_session"]["status"])
 
     async def test_snooze_feedback_reschedules_without_disabling_alarm(self) -> None:
         harness = AlarmHarness()

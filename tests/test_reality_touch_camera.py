@@ -10,12 +10,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from astrbot.api.message_components import Plain
 from astrbot_plugin_reality_companion.main import RealityCompanionPlugin
 from astrbot_plugin_reality_companion.wakeup_alarm import WakeupAlarmMixin
 
 
 CAMERA_TOOL_IMPL = RealityCompanionPlugin.pc_reality_touch_camera_snapshot
 CAMERA_GUIDANCE_IMPL = RealityCompanionPlugin.append_camera_request_guidance
+CAMERA_RESULT_RECORDER_IMPL = RealityCompanionPlugin.record_reality_touch_tool_result
+CAMERA_REPLY_GUARD_IMPL = RealityCompanionPlugin.enforce_uncertain_camera_reply_contract
 
 
 class CameraEvent:
@@ -32,6 +35,21 @@ class CameraEvent:
     @staticmethod
     def get_sender_id() -> str:
         return "u"
+
+
+class CameraResultEvent(CameraEvent):
+    def __init__(self, text: str, *, private: bool, reply: str) -> None:
+        super().__init__(text, private=private)
+        self._result = types.SimpleNamespace(chain=[Plain(reply)])
+
+    def get_result(self):
+        return self._result
+
+    def set_result(self, result) -> None:
+        self._result = result
+
+    def plain_result(self, text: str):
+        return types.SimpleNamespace(chain=[Plain(text)])
 
 
 class CameraHarness(WakeupAlarmMixin):
@@ -289,8 +307,71 @@ class RealityTouchCameraConsentTests(unittest.TestCase):
         self.assertEqual(2, len(observation["visible_evidence"]))
         self.assertIn("完整视觉摘要", observation["summary"])
 
+    def test_grounded_scene_summary_remains_available_when_direct_answer_is_missing(self) -> None:
+        harness = CameraHarness()
+        observation = harness._sanitize_reality_touch_camera_observation(
+            {
+                "scene_description": "桌上放着一本摊开的书和一杯水。",
+                "visible_evidence": ["桌面中央有一本摊开的书", "书旁有透明水杯"],
+                "answer_status": "uncertain",
+                "presence": "present",
+                "activity": "at_desk",
+                "confidence": 0.62,
+            },
+            local_brightness="normal",
+            width=640,
+            height=480,
+            analyzed=True,
+            purpose="看看我在给你看什么",
+        )
+
+        self.assertTrue(observation["answer_available"])
+        self.assertIn("桌上放着一本摊开的书", observation["scene_description"])
+
 
 class RealityTouchCameraToolScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uncertain_camera_result_replaces_fabricated_reply_before_send(self) -> None:
+        harness = CameraHarness()
+        harness._record_official_reality_touch_tool_result = AsyncMock()
+        event = CameraResultEvent(
+            "看看我在给你看什么",
+            private=True,
+            reply="摄像头画面有点糊，你是不是又在吃什么不健康的东西？快点老实交代！",
+        )
+        tool = types.SimpleNamespace(name="pc_reality_touch_camera_snapshot")
+        tool_result = types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(
+                    text=json.dumps(
+                        {"status": "observation_uncertain", "answer_available": False},
+                        ensure_ascii=False,
+                    )
+                )
+            ]
+        )
+
+        await CAMERA_RESULT_RECORDER_IMPL(harness, event, tool, {}, tool_result)
+        await CAMERA_REPLY_GUARD_IMPL(harness, event)
+
+        self.assertTrue(event._reality_touch_camera_answer_uncertain)
+        self.assertEqual("这次单帧没能可靠判断你在给我看什么，我先不乱猜。", event.get_result().chain[0].text)
+
+    async def test_successful_camera_result_keeps_reply_unchanged(self) -> None:
+        harness = CameraHarness()
+        harness._record_official_reality_touch_tool_result = AsyncMock()
+        reply = "我看到桌上有一碗面和一杯饮料。"
+        event = CameraResultEvent("看看我在吃什么", private=True, reply=reply)
+        tool = types.SimpleNamespace(name="pc_reality_touch_camera_snapshot")
+        tool_result = types.SimpleNamespace(
+            content=[types.SimpleNamespace(text='{"status":"success","answer_available":true}')]
+        )
+
+        await CAMERA_RESULT_RECORDER_IMPL(harness, event, tool, {}, tool_result)
+        await CAMERA_REPLY_GUARD_IMPL(harness, event)
+
+        self.assertFalse(event._reality_touch_camera_answer_uncertain)
+        self.assertEqual(reply, event.get_result().chain[0].text)
+
     async def test_authorized_private_food_request_injects_tool_guidance(self) -> None:
         harness = CameraHarness()
         harness._reality_touch_camera_command(
@@ -475,6 +556,7 @@ class RealityTouchCameraToolScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("上一条明确单帧视觉请求的短时重试", request.system_prompt)
         self.assertIn("完整视觉摘要、直接答案和可见证据", request.system_prompt)
         self.assertIn("不要在工具失败时猜测画面或说成‘又没看到’", request.system_prompt)
+        self.assertIn("不要撒娇逼问", request.system_prompt)
 
     async def test_camera_failure_receipt_forbids_fabricated_observation(self) -> None:
         harness = CameraHarness()
@@ -495,6 +577,7 @@ class RealityTouchCameraToolScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["must_not_claim_observed"])
         self.assertFalse(payload["same_turn_retry_allowed"])
         self.assertIn("没有获得任何可用画面", payload["final_response_instruction"])
+        self.assertIn("不要撒娇逼问", payload["final_response_instruction"])
         self.assertIn("摄像头设备被占用", payload["message"])
 
     async def test_uncertain_visual_result_preserves_successful_capture(self) -> None:
