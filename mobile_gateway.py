@@ -319,6 +319,15 @@ class MobileGatewayMixin:
             "distance_m": round(max(0.0, _number(place.get("distance_m"))), 0),
             "radius_m": round(max(0.0, _number(place.get("radius_m"))), 0),
         }
+        confidence = _clean(place.get("confidence"), 32)
+        aliases = [_clean(item, 40) for item in list(place.get("aliases") or [])[:8] if _clean(item, 40)]
+        parent_name = _clean(place.get("parent_name"), 40)
+        if confidence:
+            prompt_place["confidence"] = confidence
+        if aliases:
+            prompt_place["aliases"] = aliases
+        if parent_name:
+            prompt_place["parent_name"] = parent_name
         return {
             "available": True,
             "latitude": round(_number(item.get("latitude")), 3),
@@ -620,6 +629,13 @@ class MobileGatewayMixin:
             "kind": _clean(raw_place.get("kind"), 24),
             "distance_m": max(0.0, min(100_000.0, _number(raw_place.get("distance_m")))),
             "radius_m": max(20.0, min(5_000.0, _number(raw_place.get("radius_m"), 150.0))),
+            "confidence": _clean(raw_place.get("confidence"), 32),
+            "aliases": [
+                _clean(item, 40)
+                for item in list(raw_place.get("aliases") or [])[:8]
+                if _clean(item, 40)
+            ],
+            "parent_name": _clean(raw_place.get("parent_name"), 40),
         }
         item = {
             "latitude": latitude,
@@ -652,6 +668,18 @@ class MobileGatewayMixin:
                 "last_seen_at": time.time(),
             }
         return {"ok": True, "data": self._mobile_screen_status(user_id)}, 200
+
+    async def mobile_location_heartbeat(self) -> tuple[dict[str, Any], int]:
+        auth = self._mobile_authorize()
+        if not auth:
+            return self._mobile_json_error("未授权的移动端请求", 401)
+        user_id = _clean(auth.get("user_id"), 120)
+        with self._mobile_state_lock:
+            item = self._mobile_locations.get(user_id)
+            if not item:
+                return self._mobile_json_error("当前没有可保活的位置，请重新获取定位", 409)
+            item["received_at"] = time.time()
+        return {"ok": True, "data": self._mobile_location_snapshot(user_id)}, 200
 
     async def mobile_revoke_location(self) -> tuple[dict[str, Any], int]:
         auth = self._mobile_authorize()
@@ -762,6 +790,7 @@ class MobileGatewayMixin:
             ("POST", "/room/create", self.mobile_create_room),
             ("POST", "/room/prepare", self.mobile_prepare_rooms),
             ("POST", "/location", self.mobile_location),
+            ("POST", "/location/heartbeat", self.mobile_location_heartbeat),
             ("POST", "/location/revoke", self.mobile_revoke_location),
             ("POST", "/screen/heartbeat", self.mobile_screen_heartbeat),
             ("POST", "/session/close", self.mobile_close_session),
@@ -859,6 +888,7 @@ class MobileGatewayMixin:
         register_api(f"{prefix}/room/create", route(self.mobile_create_room), ["POST"], "Reality Companion mobile room")
         register_api(f"{prefix}/room/prepare", route(self.mobile_prepare_rooms), ["POST"], "Reality Companion warm mobile room")
         register_api(f"{prefix}/location", route(self.mobile_location), ["POST"], "Reality Companion mobile location")
+        register_api(f"{prefix}/location/heartbeat", route(self.mobile_location_heartbeat), ["POST"], "Reality Companion mobile location heartbeat")
         register_api(f"{prefix}/location/revoke", route(self.mobile_revoke_location), ["POST"], "Reality Companion revoke mobile location")
         register_api(f"{prefix}/screen/heartbeat", route(self.mobile_screen_heartbeat), ["POST"], "Reality Companion mobile screen status")
         register_api(f"{prefix}/session/close", route(self.mobile_close_session), ["POST"], "Reality Companion mobile close")

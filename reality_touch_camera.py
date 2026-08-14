@@ -61,12 +61,11 @@ class RealityTouchCameraMixin:
             runtime_site = Path(sys.executable).resolve().parent / "Lib" / "site-packages"
             original_path = list(sys.path)
             try:
-                if runtime_site.is_dir():
-                    runtime_text = str(runtime_site)
-                    sys.path[:] = [
-                        runtime_text,
-                        *(entry for entry in sys.path if str(entry).casefold() != runtime_text.casefold()),
-                    ]
+                runtime_text = str(runtime_site)
+                sys.path[:] = [
+                    runtime_text,
+                    *(entry for entry in sys.path if str(entry).casefold() != runtime_text.casefold()),
+                ]
                 return importlib.import_module("cv2")
             except Exception:
                 for module_name in tuple(sys.modules):

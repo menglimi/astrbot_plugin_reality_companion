@@ -50,6 +50,6 @@ OpenCV 只用于任务触发的单帧读取，不会持续录像。AstrBot Deskt
 }
 ```
 
-移动端独立端口的根路径包括 `/health`、`/pair`、`/status`、`/room/create`、`/location`、`/location/revoke`、`/screen/heartbeat` 和 `/session/close`。服务端暂时保留 `/astrbot_plugin_reality_companion/mobile/*` 兼容别名，但新客户端应使用根路径。接口不会返回 CORS 许可头，所有敏感响应均标记为 `no-store`；除配对外均要求会话令牌，配对用户固定为服务端配置的 `allowed_user_id`。修改监听地址、端口或启用开关后请重启 Reality Companion（或重启 AstrBot）使独立服务重新绑定。
+移动端独立端口的根路径包括 `/health`、`/pair`、`/status`、`/room/create`、`/location`、`/location/heartbeat`、`/location/revoke`、`/screen/heartbeat` 和 `/session/close`。位置心跳只延长已接收位置的有效期，不修改原始坐标或采集时间。服务端暂时保留 `/astrbot_plugin_reality_companion/mobile/*` 兼容别名，但新客户端应使用根路径。接口不会返回 CORS 许可头，所有敏感响应均标记为 `no-store`；除配对外均要求会话令牌，配对用户固定为服务端配置的 `allowed_user_id`。修改监听地址、端口或启用开关后请重启 Reality Companion（或重启 AstrBot）使独立服务重新绑定。
 
 自建客户端的屏幕共享可复用 `astrbot_plugin_screen_companion` 的远程 WebSocket：开启 `remote_mode` 并设置 `remote_auth_token`。创建视频通话房间时，网关要求 Together 返回 HTTPS 地址；没有安全地址时会返回 `409`。组网链路应提供端到端加密；若不能保证加密，请在网关前增加 HTTPS 反向代理，避免配对密钥、会话令牌和位置数据以明文传输。

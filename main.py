@@ -10,6 +10,7 @@ import re
 import secrets
 import sys
 import time
+import uuid
 import zoneinfo
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +27,7 @@ try:
 except Exception:  # pragma: no cover - allows isolated tests without AstrBot
     request = None
 
-from .helpers import _now_ts, _safe_int, _single_line
+from .helpers import _now_ts, _safe_float, _safe_int, _single_line
 from .mobile_gateway import MobileGatewayMixin
 from .wakeup_alarm import WakeupAlarmMixin
 
@@ -205,6 +206,50 @@ class RealityCompanionExtensionAPI:
     def mobile_context(self, user_id: str = "") -> dict[str, Any]:
         return self._plugin.mobile_context(user_id)
 
+    async def record_reality_touch_output(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        source: str = "reality_touch_audio",
+        delivered_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Persist cross-device output in the reality plugin's own store."""
+        normalized_user_id = _single_line(user_id, 120)
+        visible = _single_line(text, 500)
+        if not normalized_user_id or not visible:
+            return {"recorded": False, "reason": "invalid_payload"}
+        timestamp = _safe_float(delivered_at, _now_ts(), 0.0) or _now_ts()
+        host_identity = self._plugin._host_identity(normalized_user_id)
+        subject_ref = _single_line(host_identity.get("reality_subject_ref"), 160) or normalized_user_id
+        outputs = self._plugin.data.setdefault("reality_touch_outputs", {})
+        if not isinstance(outputs, dict):
+            outputs = {}
+            self._plugin.data["reality_touch_outputs"] = outputs
+        output = {
+            "text": visible,
+            "source": _single_line(source, 80) or "reality_touch_audio",
+            "delivered_at": timestamp,
+        }
+        outputs[subject_ref] = output
+        user = self._plugin._user(normalized_user_id, create=True)
+        user["last_proactive_message"] = visible
+        user["last_proactive_sent_at"] = timestamp
+        self._plugin._save_data_sync()
+        return {"recorded": True, "user_id": normalized_user_id, "delivered_at": timestamp}
+
+    def recent_output(self, user_id: str) -> dict[str, Any]:
+        """Return a detached continuity record owned by this plugin."""
+        normalized = _single_line(user_id, 120)
+        host_identity = self._plugin._host_identity(normalized)
+        subject_ref = _single_line(host_identity.get("reality_subject_ref"), 160) or normalized
+        outputs = self._plugin.data.get("reality_touch_outputs")
+        output = outputs.get(subject_ref) if isinstance(outputs, dict) else None
+        if not isinstance(output, dict):
+            user = self._plugin._user(normalized, create=False)
+            output = user.get("last_reality_touch_output") if isinstance(user, dict) else None
+        return copy.deepcopy(output) if isinstance(output, dict) else {}
+
     def apply_pending_confirmation(self, user_id: str, text: str) -> str | None:
         user = self._plugin._user(user_id, create=False)
         return self._plugin._reality_touch_apply_pending_confirmation(user, text) if user else None
@@ -307,27 +352,39 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
 
     def _load_data(self) -> dict[str, Any]:
         if not self.data_file.is_file():
-            return {"version": 1, "users": {}, "reality_touch": {}}
+            return {"version": 1, "users": {}, "reality_touch": {}, "reality_touch_outputs": {}}
         try:
             loaded = json.loads(self.data_file.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 loaded.setdefault("version", 1)
                 loaded.setdefault("users", {})
                 loaded.setdefault("reality_touch", {})
+                loaded.setdefault("reality_touch_outputs", {})
                 return loaded
         except Exception as exc:
             logger.warning("[RealityCompanion] 读取数据失败，将使用空数据: %s", _single_line(exc, 160))
-        return {"version": 1, "users": {}, "reality_touch": {}}
+        return {"version": 1, "users": {}, "reality_touch": {}, "reality_touch_outputs": {}}
 
     def _save_data_sync(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        temp = self.data_file.with_suffix(".json.tmp")
+        # Saves can arrive from both the event loop and a background thread.
+        # A shared temp filename lets concurrent writers delete each other's
+        # source before os.replace runs.
+        temp = self.data_file.with_name(
+            f".{self.data_file.name}.{uuid.uuid4().hex}.tmp"
+        )
         payload = json.dumps(self.data, ensure_ascii=False, indent=2)
-        with open(temp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, self.data_file)
+        try:
+            with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.data_file)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
 
     def _schedule_data_save(self, delay: float = 0.2) -> None:
         if isinstance(self._save_task, asyncio.Task) and not self._save_task.done():

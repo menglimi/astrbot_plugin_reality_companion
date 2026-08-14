@@ -88,6 +88,30 @@ def test_mobile_location_is_coarsened_and_expires() -> None:
     assert harness.mobile_context("owner-1")["available"] is False
 
 
+def test_mobile_location_heartbeat_refreshes_retention_without_rewriting_capture() -> None:
+    harness = GatewayHarness()
+    captured_at = time.time() - 120
+    harness._mobile_locations["owner-1"] = {
+        "latitude": 31.2,
+        "longitude": 121.5,
+        "accuracy_m": 18.0,
+        "captured_at": captured_at,
+        "received_at": captured_at,
+    }
+    token = "location-heartbeat-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+
+    payload, status = asyncio.run(invoke_mobile(harness.mobile_location_heartbeat, token=token))
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert harness._mobile_locations["owner-1"]["captured_at"] == captured_at
+    assert harness._mobile_locations["owner-1"]["received_at"] > captured_at
+
+
 def test_explicit_place_is_exposed_as_structured_environment_context() -> None:
     harness = GatewayHarness()
     now = time.time()
@@ -121,6 +145,7 @@ def test_mobile_api_registers_only_device_routes() -> None:
     paths = {item[0] for item in harness.routes}
     assert "/astrbot_plugin_reality_companion/mobile/pair" in paths
     assert "/astrbot_plugin_reality_companion/mobile/location" in paths
+    assert "/astrbot_plugin_reality_companion/mobile/location/heartbeat" in paths
     assert "/astrbot_plugin_reality_companion/mobile/room/prepare" in paths
     assert "/astrbot_plugin_reality_companion/mobile/session/close" in paths
     assert all("settings" not in path for path in paths)
