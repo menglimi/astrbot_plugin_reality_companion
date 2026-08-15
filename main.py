@@ -33,8 +33,11 @@ from .wakeup_alarm import WakeupAlarmMixin
 
 
 PLUGIN_NAME = "astrbot_plugin_reality_companion"
-PLUGIN_VERSION = "0.2.4"
+PLUGIN_VERSION = "0.2.5"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
+MANAGED_PAGE_MESSAGE = (
+    "当前能力已由“我会永远陪着你”统一管理，请前往陪伴插件的“陪伴面板”继续操作。"
+)
 _active_plugin: "RealityCompanionPlugin | None" = None
 _MISSING = object()
 
@@ -786,11 +789,13 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         cleanup = getattr(self, "_mobile_cleanup_sessions", None)
         if callable(cleanup):
             cleanup()
+        managed = self._private_companion_api() is not None
         return {
             "available": True,
             "enabled": bool(self.enable_experimental_bluetooth_wakeup),
             "camera_enabled": bool(self.enable_reality_touch_camera),
-            "private_companion_linked": self._private_companion_api() is not None,
+            "private_companion_linked": managed,
+            "managed_by_private_companion": managed,
             "users": len(self.data.get("users", {})) if isinstance(self.data.get("users"), dict) else 0,
             "audio": self._reality_touch_audio_snapshot(),
             "camera": self._reality_touch_camera_page_snapshot(),
@@ -1161,6 +1166,12 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         return {"ok": True, "data": self._reality_touch_page_snapshot(), "integration": self.integration_status()}
 
     async def page_action(self) -> dict[str, Any]:
+        if self._private_companion_api() is not None:
+            return {
+                "ok": False,
+                "status": "managed_by_private_companion",
+                "message": MANAGED_PAGE_MESSAGE,
+            }
         if request is None:
             return {"ok": False, "message": "AstrBot 页面请求上下文不可用"}
         payload = await request.json(default={}) or {}

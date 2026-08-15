@@ -95,6 +95,16 @@ function toast(message, type = "") {
   toast.timer = setTimeout(() => { node.className = ""; }, 2800);
 }
 
+function showManagedPage(managed) {
+  $("#managed-page").hidden = !managed;
+  $("#app-shell").hidden = managed;
+}
+
+function openPluginManager() {
+  try { window.top.location.assign("/#/plugins"); }
+  catch (_) { window.location.assign("/#/plugins"); }
+}
+
 function setBusy(button, busy) {
   if (!button) return;
   button.disabled = Boolean(busy);
@@ -428,6 +438,11 @@ function render(data) {
 async function load() {
   const payload = await api("/status");
   integration = payload.integration || {};
+  if (integration.managed_by_private_companion) {
+    showManagedPage(true);
+    return;
+  }
+  showManagedPage(false);
   render(payload.data || {});
 }
 
@@ -534,8 +549,10 @@ $("#refresh").addEventListener("click", async (event) => {
   event.currentTarget.classList.add("busy");
   try { await load(); toast("状态已刷新", "success"); } catch (error) { toast(error.message, "error"); } finally { event.currentTarget.classList.remove("busy"); }
 });
+$("#open-companion").addEventListener("click", openPluginManager);
 
 load().catch((error) => {
+  showManagedPage(false);
   $("#connection-dot").className = "connection-dot error";
   $("#connection-label").textContent = "连接失败";
   toast(`读取失败：${error.message}`, "error");

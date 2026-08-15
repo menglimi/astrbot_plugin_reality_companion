@@ -40,6 +40,14 @@
 * { box-sizing: border-box; }
 html { min-width: 320px; background: var(--page-tint); }
 body { margin: 0; min-width: 320px; background: radial-gradient(circle at 85% -15%, color-mix(in srgb, var(--teal) 15%, transparent), transparent 34%), linear-gradient(135deg, var(--page-tint), color-mix(in srgb, var(--page-tint) 76%, var(--surface))); color: var(--ink); }
+[hidden] { display: none !important; }
+.managed-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; box-sizing: border-box; }
+.managed-panel { width: min(620px, 100%); padding: 30px; border: 1px solid var(--line); border-radius: 7px; box-sizing: border-box; background: color-mix(in srgb, var(--surface) 92%, transparent); box-shadow: 0 18px 48px rgba(17, 27, 35, .14); }
+.managed-label { display: inline-block; margin-bottom: 14px; color: var(--teal); font-size: 11px; font-weight: 800; }
+.managed-panel h1 { margin: 0 0 12px; font-size: 24px; }
+.managed-panel p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.75; }
+.managed-panel .button { margin-top: 22px; }
+.managed-panel small { display: block; margin-top: 16px; color: var(--muted); font-size: 10px; line-height: 1.65; }
 button, input, select, textarea { font: inherit; letter-spacing: 0; }
 button { -webkit-tap-highlight-color: transparent; }
 h1, h2, h3, h4, p { margin: 0; }

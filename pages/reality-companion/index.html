@@ -7,7 +7,16 @@
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <div class="app-shell">
+  <section id="managed-page" class="managed-page" hidden>
+    <div class="managed-panel">
+      <span class="managed-label">联动接管中</span>
+      <h1>已由陪伴插件接管</h1>
+      <p>当前能力已接入“我会永远陪着你”，为避免两处配置相互覆盖，本拓展页已锁定。请在插件管理中打开“我会永远陪着你”的“陪伴面板”继续操作。</p>
+      <button id="open-companion" class="button primary" type="button">前往插件管理</button>
+      <small>需要脱离陪伴体系独立使用时，请先停用或卸载陪伴插件，再返回此页面。</small>
+    </div>
+  </section>
+  <div id="app-shell" class="app-shell" hidden>
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">R</div>
