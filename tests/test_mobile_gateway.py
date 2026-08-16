@@ -112,6 +112,44 @@ def test_mobile_location_heartbeat_refreshes_retention_without_rewriting_capture
     assert harness._mobile_locations["owner-1"]["received_at"] > captured_at
 
 
+def test_mobile_location_notifies_private_companion_after_upload() -> None:
+    harness = GatewayHarness()
+    calls: list[str] = []
+
+    class PrivateApi:
+        async def notify_mobile_location_update(self, user_id: str) -> dict:
+            calls.append(user_id)
+            return {"handled": True}
+
+    harness._private_companion_api = lambda: PrivateApi()
+    token = "location-upload-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+
+    async def scenario() -> tuple[dict, int]:
+        result = await invoke_mobile(
+            harness.mobile_location,
+            token=token,
+            payload={
+                "latitude": 31.2,
+                "longitude": 121.5,
+                "accuracy_m": 18,
+                "captured_at": time.time(),
+                "place": {"matched": True, "name": "家", "kind": "home", "confidence": "confirmed"},
+            },
+        )
+        await asyncio.sleep(0)
+        return result
+
+    body, status = asyncio.run(scenario())
+
+    assert status == 200
+    assert body["ok"] is True
+    assert calls == ["owner-1"]
+
+
 def test_explicit_place_is_exposed_as_structured_environment_context() -> None:
     harness = GatewayHarness()
     now = time.time()
@@ -147,6 +185,7 @@ def test_mobile_api_registers_only_device_routes() -> None:
     assert "/astrbot_plugin_reality_companion/mobile/location" in paths
     assert "/astrbot_plugin_reality_companion/mobile/location/heartbeat" in paths
     assert "/astrbot_plugin_reality_companion/mobile/room/prepare" in paths
+    assert "/astrbot_plugin_reality_companion/mobile/game/room/create" in paths
     assert "/astrbot_plugin_reality_companion/mobile/session/close" in paths
     assert all("settings" not in path for path in paths)
     assert len({item[1].__name__ for item in harness.routes}) == len(harness.routes)
@@ -176,6 +215,25 @@ def test_room_url_rewrite_rejects_host_injection_and_handles_ipv6(monkeypatch) -
         types.SimpleNamespace(headers={}, host="[fd7a:115c:a1e0::4]:6185"),
     )
     assert harness._mobile_rewrite_room_url(source) == "http://[fd7a:115c:a1e0::4]:6321/join/ticket?mode=call"
+
+
+def test_room_proxy_rewrites_origin_for_local_upstream() -> None:
+    harness = GatewayHarness()
+    request = types.SimpleNamespace(
+        headers={
+            "Origin": "http://100.66.1.4:6322",
+            "Referer": "http://100.66.1.4:6322/join/ticket",
+            "User-Agent": "test-phone",
+        }
+    )
+
+    together = harness._mobile_room_proxy_headers(request, "http://127.0.0.1:6321")
+    game = harness._mobile_room_proxy_headers(request, "http://127.0.0.1:6331")
+
+    assert together["Origin"] == "http://127.0.0.1:6321"
+    assert game["Origin"] == "http://127.0.0.1:6331"
+    assert together["Referer"] == "http://100.66.1.4:6322/join/ticket"
+    assert game["User-Agent"] == "test-phone"
 
 
 def test_pairing_is_fixed_to_configured_user_and_pairing_key_cannot_read_status() -> None:
@@ -299,6 +357,58 @@ def test_status_exposes_each_ready_room_mode() -> None:
     assert body["data"]["together"]["blockers"] == []
 
 
+def test_status_and_create_expose_game_companion_to_paired_phone() -> None:
+    harness = GatewayHarness()
+    calls: list[tuple[str, str]] = []
+
+    class FakeGame:
+        @staticmethod
+        def mobile_status():
+            return {
+                "available": True,
+                "ready": True,
+                "games": [
+                    {
+                        "game_type": "gomoku",
+                        "label": "五子棋",
+                        "description": "和 Bot 下棋",
+                        "enabled": True,
+                    }
+                ],
+                "blockers": [],
+            }
+
+        @staticmethod
+        async def mobile_create_room(user_id, game_type):
+            calls.append((user_id, game_type))
+            return {
+                "url": "http://127.0.0.1:6331/room/secret?visitor_token=player",
+                "room_id": "room-1",
+                "game_type": game_type,
+            }
+
+    harness._mobile_find_plugin = lambda name: FakeGame() if name == "astrbot_plugin_game_companion" else None
+    status_body = asyncio.run(harness._mobile_status_response({"user_id": "owner-1"}))
+    assert status_body["data"]["capabilities"]["games"] is True
+    assert status_body["data"]["games"]["games"][0]["game_type"] == "gomoku"
+
+    session_token = "game-session-token"
+    harness._mobile_sessions[harness._mobile_token_key(session_token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+    body, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_create_game_room,
+            token=session_token,
+            payload={"game_type": "gomoku"},
+        )
+    )
+    assert status == 200
+    assert calls == [("owner-1", "gomoku")]
+    assert body["data"]["url"] == "http://100.66.1.4:6322/room/secret?visitor_token=player"
+
+
 def test_call_room_prepares_secure_access_before_issuing_ticket() -> None:
     harness = GatewayHarness()
     events: list[str] = []
@@ -352,6 +462,22 @@ def test_call_room_prepares_secure_access_before_issuing_ticket() -> None:
     assert body["ok"] is False
     assert "HTTPS" in body["message"]
     assert events == ["ensure", "issue", "url", "revoke"]
+
+
+def test_mobile_room_access_prefers_the_unified_gateway_keyword() -> None:
+    harness = GatewayHarness()
+    calls: list[dict[str, object]] = []
+
+    class WrappedTogether:
+        @staticmethod
+        async def _ensure_mobile_room_access(**kwargs):
+            calls.append(dict(kwargs))
+            return {"tunnel_ready": True}
+
+    access = asyncio.run(harness._mobile_prepare_together_access(WrappedTogether()))
+
+    assert access["tunnel_ready"] is True
+    assert calls == [{"via_mobile_gateway": True}]
 
 
 def test_independent_aiohttp_gateway_pairs_and_preserves_http_status() -> None:

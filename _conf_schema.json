@@ -152,6 +152,13 @@
         "default": 900,
         "condition": {"enabled": true}
       },
+      "proxy_rooms": {
+        "description": "统一房间代理",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，手机创建的一起看/游戏/工作协同房间链接会指向移动网关本身，由网关转发页面、接口、媒体与 WebSocket；Together 与 Game Companion 只需在本机可达，不再要求手机直连或公网隧道。",
+        "condition": {"enabled": true}
+      },
       "screen_upload_enabled": {
         "description": "允许手机屏幕共享上报",
         "type": "bool",

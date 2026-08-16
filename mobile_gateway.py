@@ -12,6 +12,7 @@ import contextvars
 import functools
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import math
 import secrets
@@ -29,8 +30,10 @@ except Exception:  # pragma: no cover - AstrBot supplies Quart at runtime
 from astrbot.api import logger
 
 try:
+    import aiohttp
     from aiohttp import web
 except Exception:  # pragma: no cover - dependency diagnostics run at startup
+    aiohttp = None
     web = None
 
 
@@ -38,6 +41,7 @@ PLUGIN_NAME = "astrbot_plugin_reality_companion"
 MOBILE_API_VERSION = "1.0"
 MOBILE_MAX_BODY_BYTES = 256 * 1024
 MOBILE_MAX_SESSIONS_PER_USER = 8
+MOBILE_PROXY_MAX_WS_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -79,6 +83,9 @@ class MobileGatewayMixin:
         self._mobile_room_start_lock = asyncio.Lock()
         self._mobile_state_lock = threading.RLock()
         self._mobile_runtime_stopped = False
+        self._mobile_location_notify_tasks: dict[str, asyncio.Task] = {}
+        self._mobile_proxy_session: Any | None = None
+        self._mobile_room_upstream_cache: dict[str, str] = {}
 
     def _mobile_enabled(self) -> bool:
         return bool(self._cfg_bool("mobile.enabled", False))
@@ -369,6 +376,43 @@ class MobileGatewayMixin:
             },
         }
 
+    async def _notify_private_companion_location(self, user_id: str) -> None:
+        try:
+            getter = getattr(self, "_private_companion_api", None)
+            api = getter() if callable(getter) else None
+            notifier = getattr(api, "notify_mobile_location_update", None) if api is not None else None
+            if not callable(notifier):
+                return
+            result = notifier(user_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.debug("[RealityCompanion] 手机位置主动联动暂时失败: %s", _clean(exc, 160))
+
+    def _schedule_private_companion_location_notification(self, user_id: str) -> None:
+        normalized = _clean(user_id, 120)
+        if not normalized:
+            return
+        previous = self._mobile_location_notify_tasks.get(normalized)
+        if isinstance(previous, asyncio.Task) and not previous.done():
+            return
+        try:
+            creator = getattr(self, "_create_lifecycle_background_task", None)
+            task = (
+                creator(self._notify_private_companion_location(normalized), label="mobile_location_notify")
+                if callable(creator)
+                else asyncio.create_task(self._notify_private_companion_location(normalized))
+            )
+        except RuntimeError:
+            return
+        self._mobile_location_notify_tasks[normalized] = task
+
+        def clear(done: asyncio.Task) -> None:
+            if self._mobile_location_notify_tasks.get(normalized) is done:
+                self._mobile_location_notify_tasks.pop(normalized, None)
+
+        task.add_done_callback(clear)
+
     def _mobile_screen_status(self, user_id: str) -> dict[str, Any]:
         self._mobile_cleanup_sessions()
         with self._mobile_state_lock:
@@ -384,8 +428,42 @@ class MobileGatewayMixin:
             "age_seconds": age,
         }
 
+    async def _mobile_game_status(self) -> dict[str, Any]:
+        game = self._mobile_find_plugin("astrbot_plugin_game_companion")
+        if game is None:
+            return {
+                "available": False,
+                "ready": False,
+                "blockers": ["未安装或未加载游戏伴侣插件"],
+                "games": [],
+            }
+        getter = getattr(game, "mobile_status", None)
+        if not callable(getter):
+            return {
+                "available": True,
+                "ready": False,
+                "blockers": ["游戏伴侣版本过旧，缺少手机房间能力"],
+                "games": [],
+            }
+        try:
+            result = await self._mobile_call_gateway_aware(getter)
+            return result if isinstance(result, dict) else {
+                "available": True,
+                "ready": False,
+                "blockers": ["游戏伴侣状态响应无效"],
+                "games": [],
+            }
+        except Exception as exc:
+            return {
+                "available": True,
+                "ready": False,
+                "blockers": [f"读取游戏伴侣状态失败：{_clean(exc, 160)}"],
+                "games": [],
+            }
+
     async def _mobile_status_response(self, auth: dict[str, Any]) -> dict[str, Any]:
         user_id = _clean(auth.get("user_id"), 120)
+        game_status = await self._mobile_game_status()
         together = self._mobile_find_plugin("astrbot_plugin_together_companion")
         together_status: dict[str, Any] = {"available": False}
         if together is not None:
@@ -441,6 +519,7 @@ class MobileGatewayMixin:
                 "location": self._mobile_location_snapshot(user_id),
                 "screen": self._mobile_screen_status(user_id),
                 "together": together_status,
+                "games": game_status,
                 "capabilities": {
                     "room": room_ready,
                     "call": room_ready,
@@ -448,6 +527,7 @@ class MobileGatewayMixin:
                     "work": room_ready and bool(work_capability.get("available")),
                     "location": True,
                     "screen_upload": self._mobile_screen_upload_enabled(),
+                    "games": bool(game_status.get("ready")),
                 },
             },
         }
@@ -517,6 +597,27 @@ class MobileGatewayMixin:
             return self._mobile_json_error("未授权的移动端请求", 401)
         return await self._mobile_status_response(auth), 200
 
+    async def _mobile_call_gateway_aware(self, callback: Any, *args: Any) -> Any:
+        """Call a cross-plugin API through the gateway when its wrapper permits it."""
+        try:
+            result = callback(*args, via_mobile_gateway=True)
+        except TypeError as exc:
+            message = str(exc).lower()
+            if "via_mobile_gateway" not in message and "unexpected keyword" not in message:
+                raise
+            result = callback(*args)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _mobile_prepare_together_access(self, together: Any) -> dict[str, Any]:
+        """Prepare a room through the unified gateway, even for wrapped APIs."""
+        access_preparer = getattr(together, "_ensure_mobile_room_access", None)
+        if not callable(access_preparer):
+            raise RuntimeError("一起房间插件版本过旧，缺少手机安全访问能力")
+        result = await self._mobile_call_gateway_aware(access_preparer)
+        return result if isinstance(result, dict) else {}
+
     async def mobile_create_room(self) -> tuple[dict[str, Any], int]:
         auth = self._mobile_authorize()
         if not auth:
@@ -533,18 +634,22 @@ class MobileGatewayMixin:
             return self._mobile_json_error("工作协同需要先启用屏幕伙伴", 409)
         if together._get_chat_provider() is None:
             return self._mobile_json_error("一起房间尚未配置实时对话模型", 409)
-        access_preparer = getattr(together, "_ensure_mobile_room_access", None)
-        if not callable(access_preparer):
-            return self._mobile_json_error("一起房间插件版本过旧，缺少手机安全访问能力", 503)
         async with self._mobile_room_start_lock:
             try:
-                await access_preparer()
+                await self._mobile_prepare_together_access(together)
             except Exception as exc:
                 return self._mobile_json_error(f"手机房间准备失败：{_clean(exc, 180)}", 503)
             ticket = together.issue_room_ticket(mode=mode, user_id=user_id)
             room_url = together._ticket_url(ticket)
-        room_url = self._mobile_rewrite_room_url(room_url)
-        if mode == "call" and urlsplit(room_url).scheme.lower() != "https":
+        # 原生 App 的摄像头/麦克风走系统权限而非浏览器安全上下文；
+        # 经统一代理时允许 LAN 明文通话，浏览器场景仍强制 HTTPS。
+        native_client = _clean(payload.get("client"), 40).lower() in {"android_native", "android-native"}
+        room_url = self._mobile_room_url_via_gateway(room_url)
+        if (
+            mode == "call"
+            and urlsplit(room_url).scheme.lower() != "https"
+            and not (native_client and self._mobile_proxy_rooms_enabled())
+        ):
             revoker = getattr(together, "_revoke_unused_ticket", None)
             if callable(revoker):
                 revoker(ticket)
@@ -561,6 +666,37 @@ class MobileGatewayMixin:
             },
         }, 200
 
+    async def mobile_create_game_room(self) -> tuple[dict[str, Any], int]:
+        auth = self._mobile_authorize()
+        if not auth:
+            return self._mobile_json_error("未授权的移动端请求", 401)
+        game = self._mobile_find_plugin("astrbot_plugin_game_companion")
+        if game is None:
+            return self._mobile_json_error("未安装或未加载游戏伴侣插件", 503)
+        creator = getattr(game, "mobile_create_room", None)
+        if not callable(creator):
+            return self._mobile_json_error("游戏伴侣版本过旧，缺少手机房间能力", 503)
+        payload = await self._mobile_request_payload()
+        game_type = _clean(payload.get("game_type"), 32)
+        try:
+            result = await self._mobile_call_gateway_aware(
+                creator,
+                _clean(auth.get("user_id"), 120),
+                game_type,
+            )
+        except (ValueError, PermissionError) as exc:
+            return self._mobile_json_error(str(exc), 409)
+        except (RuntimeError, OSError) as exc:
+            return self._mobile_json_error(str(exc), 503)
+        except Exception as exc:
+            logger.exception("[RealityCompanion] 手机游戏房间创建失败: %s", _clean(exc, 180))
+            return self._mobile_json_error("手机游戏房间创建失败", 500)
+        if not isinstance(result, dict) or not result.get("url"):
+            return self._mobile_json_error("游戏伴侣没有返回可用房间链接", 503)
+        result = dict(result)
+        result["url"] = self._mobile_room_url_via_gateway(str(result.get("url") or ""))
+        return {"ok": True, "data": result}, 200
+
     async def mobile_prepare_rooms(self) -> tuple[dict[str, Any], int]:
         """Warm mobile HTTPS room access without issuing a room ticket."""
         auth = self._mobile_authorize()
@@ -571,12 +707,9 @@ class MobileGatewayMixin:
             return self._mobile_json_error("未安装或未加载一起房间插件", 503)
         if together._get_chat_provider() is None:
             return self._mobile_json_error("一起房间尚未配置实时对话模型", 409)
-        access_preparer = getattr(together, "_ensure_mobile_room_access", None)
-        if not callable(access_preparer):
-            return self._mobile_json_error("一起房间插件版本过旧，缺少手机安全访问能力", 503)
         async with self._mobile_room_start_lock:
             try:
-                access = await access_preparer()
+                access = await self._mobile_prepare_together_access(together)
             except Exception as exc:
                 return self._mobile_json_error(f"共同房间预热失败：{_clean(exc, 180)}", 503)
         return {"ok": True, "data": {"ready": bool(access.get("tunnel_ready", False)) if isinstance(access, dict) else True}}, 200
@@ -596,6 +729,231 @@ class MobileGatewayMixin:
             return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
         except Exception:
             return room_url
+
+    # ------------------------------------------------------------------
+    # 统一房间代理：手机只连移动网关，房间页面/接口/媒体/WS 由网关转发。
+    # 路径原样保持（/join、/ws、/media、/avatar → 一起；/room/<token>、
+    # /api/room → 游戏），因此新旧客户端与网页相对路径都无需改动。
+    # ------------------------------------------------------------------
+
+    def _mobile_proxy_rooms_enabled(self) -> bool:
+        return bool(self._cfg_bool("mobile.proxy_rooms", True))
+
+    def _mobile_room_upstream(self, service: str) -> str:
+        if service in self._mobile_room_upstream_cache:
+            return self._mobile_room_upstream_cache[service]
+        plugin_name = {
+            "together": "astrbot_plugin_together_companion",
+            "game": "astrbot_plugin_game_companion",
+        }.get(service, "")
+        if not plugin_name:
+            return ""
+        plugin = self._mobile_find_plugin(plugin_name)
+        base = ""
+        if plugin is not None:
+            room_server = getattr(plugin, "room_server", None)
+            base = str(getattr(room_server, "local_base_url", "") or "")
+            if not base:
+                getter = getattr(plugin, "_room_base_url", None)
+                base = str(getter() or "") if callable(getter) else ""
+        base = base.strip().rstrip("/")
+        try:
+            parsed = urlsplit(base)
+            if parsed.hostname in {"0.0.0.0", ""}:
+                # 绑定 0.0.0.0 时本机回环可达；网关代为转发后手机不再感知
+                netloc = "127.0.0.1" if parsed.port is None else f"127.0.0.1:{parsed.port}"
+                base = urlunsplit((parsed.scheme or "http", netloc, parsed.path, "", ""))
+        except Exception:
+            pass
+        if base:
+            self._mobile_room_upstream_cache[service] = base
+        return base
+
+    @staticmethod
+    def _mobile_room_upstream_origin(upstream: str) -> str:
+        """Return the origin that the local room service sees behind the proxy."""
+        try:
+            parsed = urlsplit(str(upstream or ""))
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+        except Exception:
+            pass
+        return ""
+
+    def _mobile_room_proxy_headers(self, aio_request: Any, upstream: str) -> dict[str, str]:
+        """Forward browser headers while satisfying the upstream origin check."""
+        forward_headers: dict[str, str] = {}
+        for key in ("Range", "Content-Type", "Accept", "Authorization", "Referer", "User-Agent"):
+            value = aio_request.headers.get(key)
+            if value:
+                forward_headers[key] = value
+        upstream_origin = self._mobile_room_upstream_origin(upstream)
+        if upstream_origin:
+            # The browser Origin is the mobile gateway, but the room service
+            # validates same-origin requests against its own local listener.
+            forward_headers["Origin"] = upstream_origin
+        return forward_headers
+
+    def _mobile_room_url_via_gateway(self, room_url: str) -> str:
+        """把房间链接改写为移动网关自身地址，路径与查询原样保留。"""
+        fallback = self._mobile_rewrite_room_url(room_url)
+        if not self._mobile_proxy_rooms_enabled():
+            return fallback
+        try:
+            parsed = urlsplit(str(room_url or ""))
+            if not parsed.path:
+                return fallback
+            host = self._mobile_normalize_host(self._mobile_request_host())
+            if not host:
+                return fallback
+            port = self._mobile_server_bound_port or self._mobile_port()
+            netloc = f"[{host}]" if ":" in host else host
+            query = f"?{parsed.query}" if parsed.query else ""
+            return f"http://{netloc}:{port}{parsed.path}{query}"
+        except Exception:
+            return fallback
+
+    async def _mobile_room_proxy(self, aio_request: Any, service: str) -> Any:
+        if web is None or aiohttp is None:  # pragma: no cover - startup guarded
+            return web.Response(status=503, text="aiohttp unavailable", content_type="text/plain")
+        upstream = self._mobile_room_upstream(service)
+        if not upstream:
+            return web.Response(
+                status=503,
+                text=f"{service} 房间服务不可用",
+                content_type="text/plain",
+            )
+        target = upstream + aio_request.path
+        if aio_request.query_string:
+            target = f"{target}?{aio_request.query_string}"
+        forward_headers = self._mobile_room_proxy_headers(aio_request, upstream)
+        body = await aio_request.read() if aio_request.can_read_body else None
+        session = self._mobile_proxy_session or aiohttp.ClientSession()
+        owns_session = session is self._mobile_proxy_session
+        try:
+            async with session.request(
+                aio_request.method,
+                target,
+                headers=forward_headers,
+                data=body,
+                allow_redirects=True,
+            ) as response:
+                if response.status >= 400:
+                    error_body = await response.read()
+                    return web.Response(
+                        status=response.status,
+                        body=error_body[:MOBILE_MAX_BODY_BYTES],
+                        content_type=response.content_type or "text/plain",
+                    )
+                stream = web.StreamResponse(status=response.status, reason=response.reason)
+                for header in (
+                    "Content-Type",
+                    "Content-Range",
+                    "Accept-Ranges",
+                    "Cache-Control",
+                    "Content-Disposition",
+                ):
+                    value = response.headers.get(header)
+                    if value:
+                        stream.headers[header] = value
+                await stream.prepare(aio_request)
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    await stream.write(chunk)
+                await stream.write_eof()
+                return stream
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[RealityCompanion] 房间代理转发失败: service=%s path=%s error=%s",
+                service,
+                _clean(aio_request.path, 120),
+                _clean(exc, 160),
+            )
+            return web.Response(status=502, text="房间代理转发失败", content_type="text/plain")
+        finally:
+            if not owns_session:
+                await session.close()
+
+    async def _mobile_room_assets_proxy(self, aio_request: Any) -> Any:
+        # 一起与游戏的房间页面都引用 /assets/<name>：按 Referer 区分来源，
+        # 无 Referer 时先试一起，404 再试游戏。
+        referer = str(aio_request.headers.get("Referer") or "")
+        if "/room/" in referer:
+            return await self._mobile_room_proxy(aio_request, "game")
+        if "/join/" in referer:
+            return await self._mobile_room_proxy(aio_request, "together")
+        first = await self._mobile_room_proxy(aio_request, "together")
+        if first.status < 400:
+            return first
+        second = await self._mobile_room_proxy(aio_request, "game")
+        return second if second.status < 400 else first
+
+    async def _mobile_room_ws_proxy(self, aio_request: Any) -> Any:
+        if web is None or aiohttp is None:  # pragma: no cover - startup guarded
+            return web.Response(status=503, text="aiohttp unavailable", content_type="text/plain")
+        upstream = self._mobile_room_upstream("together")
+        if not upstream:
+            return web.Response(status=503, text="together 房间服务不可用", content_type="text/plain")
+        server_ws = web.WebSocketResponse(
+            heartbeat=20.0,
+            autoping=True,
+            max_msg_size=MOBILE_PROXY_MAX_WS_BYTES,
+        )
+        await server_ws.prepare(aio_request)
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=10.0))
+        upstream_ws = None
+        try:
+            headers = {"Origin": upstream}
+            for key, value in aio_request.headers.items():
+                if key.lower().startswith("x-together"):
+                    headers[key] = value
+            target = f"{upstream}/ws"
+            if aio_request.query_string:
+                target = f"{target}?{aio_request.query_string}"
+            upstream_ws = await session.ws_connect(
+                target,
+                headers=headers,
+                heartbeat=20.0,
+                max_msg_size=MOBILE_PROXY_MAX_WS_BYTES,
+            )
+
+            async def pump(source: Any, sink: Any) -> None:
+                async for message in source:
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        await sink.send_str(message.data)
+                    elif message.type == aiohttp.WSMsgType.BINARY:
+                        await sink.send_bytes(message.data)
+                    else:
+                        break
+
+            tasks = [
+                asyncio.create_task(pump(server_ws, upstream_ws)),
+                asyncio.create_task(pump(upstream_ws, server_ws)),
+            ]
+            try:
+                _done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+            finally:
+                for task in tasks:
+                    task.cancel()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[RealityCompanion] 房间 WS 代理失败: %s", _clean(exc, 160))
+        finally:
+            for closer in (upstream_ws, session):
+                try:
+                    if closer is not None:
+                        await closer.close()
+                except Exception:
+                    pass
+            try:
+                await server_ws.close()
+            except Exception:
+                pass
+        return server_ws
 
     async def mobile_location(self) -> tuple[dict[str, Any], int]:
         auth = self._mobile_authorize()
@@ -651,6 +1009,7 @@ class MobileGatewayMixin:
         }
         with self._mobile_state_lock:
             self._mobile_locations[user_id] = item
+        self._schedule_private_companion_location_notification(user_id)
         return {"ok": True, "data": self._mobile_location_snapshot(user_id)}, 200
 
     async def mobile_screen_heartbeat(self) -> tuple[dict[str, Any], int]:
@@ -788,6 +1147,7 @@ class MobileGatewayMixin:
             ("POST", "/pair", self.mobile_pair),
             ("GET", "/status", self.mobile_status),
             ("POST", "/room/create", self.mobile_create_room),
+            ("POST", "/game/room/create", self.mobile_create_game_room),
             ("POST", "/room/prepare", self.mobile_prepare_rooms),
             ("POST", "/location", self.mobile_location),
             ("POST", "/location/heartbeat", self.mobile_location_heartbeat),
@@ -808,6 +1168,26 @@ class MobileGatewayMixin:
                 path,
                 functools.partial(self._mobile_aiohttp_dispatch, handler=handler),
             )
+
+        # 统一房间代理：路径与各房间服务保持一致，注册在自有路由之后。
+        # /room/{access_token} 与 POST /room/create 方法不同，aiohttp 会继续
+        # 匹配后续动态路由，互不冲突。
+        if self._mobile_proxy_rooms_enabled() and aiohttp is not None:
+            proxy_routes = (
+                ("*", "/join/{tail:.*}", functools.partial(self._mobile_room_proxy, service="together")),
+                ("GET", "/media/{tail:.*}", functools.partial(self._mobile_room_proxy, service="together")),
+                ("GET", "/avatar", functools.partial(self._mobile_room_proxy, service="together")),
+                ("*", "/assets/{name}", self._mobile_room_assets_proxy),
+                ("*", "/api/room/{tail:.*}", functools.partial(self._mobile_room_proxy, service="game")),
+                ("GET", "/room/{access_token}", functools.partial(self._mobile_room_proxy, service="game")),
+                ("GET", "/ws", self._mobile_room_ws_proxy),
+            )
+            for method, path, handler in proxy_routes:
+                app.router.add_route(method, path, handler)
+            self._mobile_proxy_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, connect=10.0),
+            )
+            logger.info("[RealityCompanion] 移动网关已启用统一房间代理")
 
         runner = web.AppRunner(app, access_log=None)
         try:
@@ -852,6 +1232,13 @@ class MobileGatewayMixin:
         self._mobile_server_runner = None
         self._mobile_server_bound_port = 0
         self._mobile_runtime_stopped = True
+        session = self._mobile_proxy_session
+        self._mobile_proxy_session = None
+        try:
+            if session is not None:
+                await session.close()
+        except Exception:
+            pass
         try:
             if site is not None:
                 await site.stop()
@@ -886,6 +1273,7 @@ class MobileGatewayMixin:
         register_api(f"{prefix}/pair", route(self.mobile_pair), ["POST"], "Reality Companion mobile pair")
         register_api(f"{prefix}/status", route(self.mobile_status), ["GET"], "Reality Companion mobile status")
         register_api(f"{prefix}/room/create", route(self.mobile_create_room), ["POST"], "Reality Companion mobile room")
+        register_api(f"{prefix}/game/room/create", route(self.mobile_create_game_room), ["POST"], "Reality Companion mobile game room")
         register_api(f"{prefix}/room/prepare", route(self.mobile_prepare_rooms), ["POST"], "Reality Companion warm mobile room")
         register_api(f"{prefix}/location", route(self.mobile_location), ["POST"], "Reality Companion mobile location")
         register_api(f"{prefix}/location/heartbeat", route(self.mobile_location_heartbeat), ["POST"], "Reality Companion mobile location heartbeat")
