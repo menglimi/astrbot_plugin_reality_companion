@@ -20,9 +20,6 @@ support_platforms:
   - aiocqhttp
   - qq_official
 astrbot_version: ">=4.22.0"
-pages:
-  - name: reality-companion
-    title: 现实触及
 help: |
   私聊命令：
   - /现实触及

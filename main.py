@@ -1302,6 +1302,7 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
                 "pairing_token_configured": bool(self._mobile_pairing_token()),
                 "running": self._mobile_server_runner is not None,
                 "bound_port": _safe_int(self._mobile_server_bound_port, 0, 0, 65535),
+                "active_sessions": len(self._mobile_sessions),
             },
         }
 
