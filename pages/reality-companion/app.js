@@ -186,6 +186,7 @@ function configPayload() {
       pairing_token: $("#mobile-token").value.trim(),
       session_ttl_hours: numberValue("#mobile-session-ttl", 168),
       location_ttl_seconds: numberValue("#mobile-location-ttl", 900),
+      proxy_rooms: $("#mobile-proxy-rooms").checked,
       screen_upload_enabled: $("#mobile-screen").checked,
     },
   };
@@ -418,11 +419,34 @@ function renderMobile(data) {
   $("#mobile-user").value = mobile.allowed_user_id || "";
   $("#mobile-session-ttl").value = mobile.session_ttl_hours ?? 168;
   $("#mobile-location-ttl").value = mobile.location_ttl_seconds ?? 900;
+  $("#mobile-proxy-rooms").checked = mobile.proxy_rooms !== false;
   $("#mobile-screen").checked = mobile.screen_upload_enabled !== false;
   $("#mobile-token-note").textContent = mobile.pairing_token_configured ? "已配置令牌；留空将保持原值。" : "尚未配置；启用前请填写至少 24 位随机字符。";
   setBadge($("#mobile-badge"), mobile.running ? "网关运行中" : (mobile.enabled ? "启动失败" : "当前已关闭"), mobile.running ? "good" : (mobile.enabled ? "bad" : "warn"));
-  const endpoint = mobile.running ? `http://${mobile.host}:${mobile.bound_port || mobile.port}` : "网关未监听";
-  $("#mobile-runtime").innerHTML = `<code>${escapeHtml(endpoint)}</code><p>${mobile.running ? "Android 端使用该地址完成配对。会话与位置上下文仅保存在内存中。" : "保存并启用网关后，这里会显示当前监听端点。"}</p>`;
+  const clientHost = mobile.host === "0.0.0.0" ? "电脑组网 IP" : (mobile.host || "电脑组网 IP");
+  const endpoint = mobile.running ? `http://${clientHost}:${mobile.bound_port || mobile.port}` : "网关未监听";
+  const gatewayVersion = mobile.gateway_version || "0.2.7";
+  const apiVersion = mobile.api_version || "1.0";
+  const port = mobile.bound_port || mobile.port || 6322;
+  $("#mobile-runtime").innerHTML = `
+    <div class="mobile-runtime-meta">
+      <span><b>网关版本</b>v${escapeHtml(gatewayVersion)}</span>
+      <span><b>终端兼容 API</b>v${escapeHtml(apiVersion)}</span>
+      <span><b>房间代理</b>${mobile.proxy_rooms !== false ? "已开启" : "已关闭"}</span>
+    </div>
+    <code>${escapeHtml(endpoint)}</code>
+    <div class="mobile-connection-guide">
+      <section><b>怎么连接</b><ul>
+        <li><strong>局域网 / Tailscale、ZeroTier：</strong>手机填写 <code>http://电脑组网 IP:${port}</code>，不要填写 127.0.0.1、localhost 或 0.0.0.0。</li>
+        <li><strong>跨网络 / 公网：</strong>使用 HTTPS 反向代理或安全隧道；浏览器房间不要使用公网纯 HTTP。</li>
+        <li><strong>本机测试：</strong>电脑可访问 <code>http://127.0.0.1:${port}</code>，手机不能访问这个地址。</li>
+      </ul><p>保存后，在与 Bot 的私聊发送“现实触及 配对令牌”，再用令牌完成配对。</p></section>
+      <section class="mobile-connection-trouble"><b>一起功能一直连接中</b><ul>
+        <li>确认房间代理已开启，手机使用移动网关端口，而不是 Together 直连端口（常见为 6321）。</li>
+        <li>确认一起房间服务正在运行，并配置了实时共处对话模型。</li>
+        <li>修改端口或代理模式后保存并重启网关，再重新打开房间链接。</li>
+      </ul></section>
+    </div>`;
 }
 
 function render(data) {

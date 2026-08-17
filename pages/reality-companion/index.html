@@ -141,11 +141,12 @@
                 <label class="field"><span>会话有效期（小时）</span><input id="mobile-session-ttl" type="number" min="1" max="720" /></label>
                 <label class="field"><span>位置上下文有效期（秒）</span><input id="mobile-location-ttl" type="number" min="60" max="86400" step="60" /></label>
               </div>
+              <label class="switch-row full"><span><b>统一代理一起 / 游戏 / 协同房间</b><small>手机只访问移动网关，由网关转发页面、接口、媒体与 WebSocket；推荐保持开启。</small></span><input id="mobile-proxy-rooms" type="checkbox" /><i aria-hidden="true"></i></label>
               <label class="switch-row full"><span><b>允许屏幕共享状态上报</b><small>Screen Companion 仍需单独配置远程识屏和令牌。</small></span><input id="mobile-screen" type="checkbox" /><i aria-hidden="true"></i></label>
               <div class="form-actions"><button class="button primary" type="submit">保存并重启网关</button></div>
             </form>
           </section>
-          <section class="panel-section"><div class="section-head"><div><p>连接信息</p><h2>当前端点</h2></div></div><div id="mobile-runtime" class="endpoint-box"></div></section>
+          <section class="panel-section"><div class="section-head"><div><p>连接信息</p><h2>当前端点与排障</h2></div></div><div id="mobile-runtime" class="endpoint-box"></div></section>
         </section>
       </main>
     </div>

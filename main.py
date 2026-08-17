@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover - allows isolated tests without AstrBot
     request = None
 
 from .helpers import _now_ts, _safe_float, _safe_int, _single_line
-from .mobile_gateway import MobileGatewayMixin
+from .mobile_gateway import MOBILE_API_VERSION, MobileGatewayMixin
 from .wakeup_alarm import WakeupAlarmMixin
 
 
@@ -1386,12 +1386,15 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             "authorized_user_ids": sorted(self.authorized_user_ids),
             "audio_default_playback_volume": _safe_int(self.tts_local_playback_volume, 35, 0, 100),
             "mobile": {
+                "gateway_version": PLUGIN_VERSION,
+                "api_version": MOBILE_API_VERSION,
                 "enabled": self._mobile_enabled(),
                 "host": self._mobile_host(),
                 "port": self._mobile_port(),
                 "allowed_user_id": self._mobile_allowed_user_id(),
                 "session_ttl_hours": self._cfg_int("mobile.session_ttl_hours", 168, 1, 720),
                 "location_ttl_seconds": self._mobile_location_ttl(),
+                "proxy_rooms": self._cfg_bool("mobile.proxy_rooms", True),
                 "screen_upload_enabled": self._mobile_screen_upload_enabled(),
                 "pairing_token_configured": bool(self._mobile_pairing_token()),
                 "running": self._mobile_server_runner is not None,
@@ -1431,6 +1434,7 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             "allowed_user_id": _single_line(mobile.get("allowed_user_id"), 120),
             "session_ttl_hours": _safe_int(mobile.get("session_ttl_hours"), 168, 1, 720),
             "location_ttl_seconds": _safe_int(mobile.get("location_ttl_seconds"), 900, 60, 86400),
+            "proxy_rooms": self._coerce_config_bool(mobile.get("proxy_rooms"), True),
             "screen_upload_enabled": self._coerce_config_bool(mobile.get("screen_upload_enabled"), True),
         }
         for key, value in mobile_values.items():
