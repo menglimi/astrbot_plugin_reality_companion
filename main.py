@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import importlib
 import json
@@ -18,7 +19,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 
@@ -33,7 +34,7 @@ from .wakeup_alarm import WakeupAlarmMixin
 
 
 PLUGIN_NAME = "astrbot_plugin_reality_companion"
-PLUGIN_VERSION = "0.2.5"
+PLUGIN_VERSION = "0.2.7"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 MANAGED_PAGE_MESSAGE = (
     "当前能力已由“我会永远陪着你”统一管理，请前往陪伴插件的“陪伴面板”继续操作。"
@@ -823,15 +824,66 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             return
         raw = str(getattr(event, "message_str", "") or "")
         value = re.sub(r"^\s*/?(?:现实触及|来到身边)\s*", "", raw, count=1).strip()
-        pairing_action = re.sub(r"[\s，,。.!！;；:：]+", "", value)
-        if pairing_action in {"配对令牌", "查看配对令牌", "输出配对令牌", "生成配对令牌"}:
+        command_action = re.sub(r"[\s，,。.!！;；:：]+", "", value)
+        if command_action in {"配对令牌", "查看配对令牌", "输出配对令牌", "生成配对令牌"}:
             yield event.plain_result(await self._mobile_pairing_token_command(rotate=False))
             return
-        if pairing_action in {"重置配对令牌", "重新生成配对令牌", "刷新配对令牌"}:
+        if command_action in {"重置配对令牌", "重新生成配对令牌", "刷新配对令牌"}:
             yield event.plain_result(await self._mobile_pairing_token_command(rotate=True))
             return
         user = self._user(user_id)
         user["umo"] = _single_line(getattr(event, "unified_msg_origin", ""), 180)
+        if command_action in {
+            "摄像头单帧", "输出摄像头单帧", "查看摄像头单帧", "摄像头截图", "输出摄像头截图",
+        }:
+            result = await self._reality_touch_camera_snapshot_for_user(
+                user_id,
+                "用户通过现实触及指令明确请求输出当前摄像头单帧",
+                include_preview=True,
+                source="manual_command",
+            )
+            observation = result.get("observation") if isinstance(result.get("observation"), dict) else {}
+            detail = _single_line(observation.get("summary"), 300)
+            message = _single_line(result.get("message"), 240) or "摄像头单帧读取失败"
+            if result.get("captured"):
+                message = "摄像头单帧读取完成" + (f"：{detail}" if detail else "。")
+            preview = str(result.get("preview_data_url") or "")
+            if preview.startswith("data:image/jpeg;base64,"):
+                try:
+                    image_bytes = base64.b64decode(preview.split(",", 1)[1], validate=True)
+                except (ValueError, TypeError):
+                    image_bytes = b""
+                if image_bytes:
+                    yield event.chain_result([Plain(message), Image.fromBytes(image_bytes)])
+                    return
+            yield event.plain_result(message)
+            return
+        if command_action in {"语音试听", "试听语音", "音频试听", "试听音频", "声音试听"}:
+            if not bool(self.enable_experimental_bluetooth_wakeup):
+                yield event.plain_result("现实触及总开关未开启，无法进行语音试听。")
+                return
+            if not self._reality_touch_audio_consented(user):
+                yield event.plain_result("尚未完成现实触及音频知情确认，请先发送“现实触及 确认”。")
+                return
+            audio = self._reality_touch_audio_snapshot()
+            policy = self._reality_touch_policy(user)
+            configured_volume = policy.get("playback_volume")
+            volume = _safe_int(
+                configured_volume if configured_volume is not None else audio.get("playback_volume"),
+                35,
+                0,
+                100,
+            )
+            played = await self._play_reality_touch_test_audio(volume)
+            device = _single_line(audio.get("label"), 160) or "跟随系统默认输出"
+            if played:
+                yield event.plain_result(f"语音试听已播放。输出设备：{device}；音量：{volume}%。")
+            else:
+                yield event.plain_result(f"语音试听失败。当前输出设备：{device}；请检查设备连接和音频依赖。")
+            return
+        if command_action in {"位置检查", "检查位置", "查看位置", "定位检查", "检查定位"}:
+            yield event.plain_result(self._reality_touch_location_check_text(user_id))
+            return
         response, followup = self._wakeup_alarm_command(user, value)
         self._save_data_sync()
         yield event.plain_result(response)
@@ -850,6 +902,48 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             )
         elif followup:
             self._create_lifecycle_background_task(self._test_wakeup_alarm(user), label="wakeup_test")
+
+    def _reality_touch_location_check_text(self, user_id: str) -> str:
+        context = self.mobile_context(user_id)
+        location = context.get("location") if isinstance(context.get("location"), dict) else {}
+        if not context.get("available"):
+            reason = _single_line(location.get("reason"), 80)
+            if reason == "mobile_gateway_disabled":
+                return "位置检查：手机陪伴终端网关未启用或尚未运行。"
+            ttl = _safe_int(
+                (context.get("privacy") or {}).get("expires_after_seconds")
+                if isinstance(context.get("privacy"), dict) else 0,
+                900,
+                60,
+            )
+            return f"位置检查：当前没有有效的手机前台位置；可能尚未上报、已撤销或已超过 {ttl} 秒有效期。"
+
+        parts = ["位置检查：手机陪伴终端位置有效"]
+        place = location.get("place") if isinstance(location.get("place"), dict) else {}
+        place_name = _single_line(place.get("name"), 40) if place.get("matched") else ""
+        label = _single_line(location.get("label"), 40)
+        if place_name:
+            parts.append(f"标记地点：{place_name}")
+        elif label:
+            parts.append(f"设备标记：{label}")
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+        if latitude is not None and longitude is not None:
+            parts.append(f"约略坐标：{latitude}, {longitude}")
+        accuracy = _safe_float(location.get("accuracy_m"), 0.0, 0.0)
+        if accuracy > 0:
+            parts.append(f"精度约 {round(accuracy)} 米")
+        captured_at = _safe_float(location.get("captured_at"), 0.0, 0.0)
+        if captured_at > 0:
+            try:
+                timezone = zoneinfo.ZoneInfo(self.environment_perception_timezone or "Asia/Shanghai")
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+                timezone = zoneinfo.ZoneInfo("Asia/Shanghai")
+            captured_text = datetime.fromtimestamp(captured_at, timezone).strftime("%Y-%m-%d %H:%M:%S")
+            parts.append(f"采集时间：{captured_text}")
+        age = _safe_int(location.get("age_seconds"), 0, 0)
+        parts.append(f"距采集约 {age} 秒")
+        return "；".join(parts) + "。"
 
     async def _mobile_pairing_token_command(self, *, rotate: bool) -> str:
         token = self._mobile_pairing_token()
