@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import sys
 import types
 import unittest
 from unittest.mock import AsyncMock
@@ -40,6 +41,25 @@ async def collect_command(plugin: RealityCompanionPlugin, text: str, *, private:
 
 
 class RealityTouchDirectCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_private_companion_discovery_does_not_trigger_lazy_module_import(self) -> None:
+        class LazyModule(types.ModuleType):
+            def __getattr__(self, name: str):
+                raise ModuleNotFoundError("No module named 'torchvision'", name="torchvision")
+
+        module_name = "transformers.lazy_astrbot_plugin_private_companion.main"
+        module = LazyModule(module_name)
+        previous = sys.modules.get(module_name)
+        sys.modules[module_name] = module
+        try:
+            plugin = RealityCompanionPlugin.__new__(RealityCompanionPlugin)
+            plugin.context = types.SimpleNamespace(get_registered_star=lambda _name: None)
+            self.assertIsNone(plugin._private_companion_api())
+        finally:
+            if previous is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = previous
+
     async def test_camera_frame_returns_ephemeral_image_and_summary(self) -> None:
         plugin = command_plugin()
         preview = base64.b64encode(b"jpeg-frame").decode("ascii")

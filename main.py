@@ -488,7 +488,11 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         for module in modules:
             if module is None:
                 continue
-            getter = getattr(module, "get_private_companion_api", None)
+            try:
+                namespace = object.__getattribute__(module, "__dict__")
+            except Exception:
+                namespace = {}
+            getter = namespace.get("get_private_companion_api") if isinstance(namespace, dict) else None
             try:
                 api = getter() if callable(getter) else None
             except Exception:
