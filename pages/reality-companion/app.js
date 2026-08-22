@@ -186,6 +186,14 @@ function configPayload() {
       pairing_token: $("#mobile-token").value.trim(),
       session_ttl_hours: numberValue("#mobile-session-ttl", 168),
       location_ttl_seconds: numberValue("#mobile-location-ttl", 900),
+      amap_reverse_geocode_enabled: $("#mobile-amap-enabled").checked,
+      amap_api_key: $("#mobile-amap-key").value.trim(),
+      amap_cache_ttl_seconds: numberValue("#mobile-amap-cache-ttl", 1800),
+      amap_request_timeout_seconds: numberValue("#mobile-amap-timeout", 5),
+      telemetry_enabled: $("#mobile-telemetry").checked,
+      telemetry_ttl_seconds: numberValue("#mobile-telemetry-ttl", 3600),
+      activity_enabled: $("#mobile-activity").checked,
+      activity_ttl_seconds: numberValue("#mobile-activity-ttl", 900),
       proxy_rooms: $("#mobile-proxy-rooms").checked,
       screen_upload_enabled: $("#mobile-screen").checked,
     },
@@ -419,6 +427,17 @@ function renderMobile(data) {
   $("#mobile-user").value = mobile.allowed_user_id || "";
   $("#mobile-session-ttl").value = mobile.session_ttl_hours ?? 168;
   $("#mobile-location-ttl").value = mobile.location_ttl_seconds ?? 900;
+  $("#mobile-amap-enabled").checked = mobile.amap_reverse_geocode_enabled === true;
+  $("#mobile-amap-cache-ttl").value = mobile.amap_cache_ttl_seconds ?? 1800;
+  $("#mobile-amap-timeout").value = mobile.amap_request_timeout_seconds ?? 5;
+  $("#mobile-amap-key").value = "";
+  const amapConfigured = mobile.amap_api_key_configured === true;
+  setBadge($("#mobile-amap-badge"), mobile.amap_reverse_geocode_enabled && amapConfigured ? "区域识别已启用" : (amapConfigured ? "Key 已配置" : "未配置"), mobile.amap_reverse_geocode_enabled && amapConfigured ? "good" : (amapConfigured ? "warn" : ""));
+  $("#mobile-amap-key-note").textContent = amapConfigured ? "已配置 Key；留空保持原值，不会在页面回显。" : "尚未配置；Key 仅保存在服务端，不会下发到手机。";
+  $("#mobile-telemetry-ttl").value = mobile.telemetry_ttl_seconds ?? 3600;
+  $("#mobile-telemetry").checked = mobile.telemetry_enabled === true;
+  $("#mobile-activity-ttl").value = mobile.activity_ttl_seconds ?? 900;
+  $("#mobile-activity").checked = mobile.activity_enabled === true;
   $("#mobile-proxy-rooms").checked = mobile.proxy_rooms !== false;
   $("#mobile-screen").checked = mobile.screen_upload_enabled !== false;
   $("#mobile-token-note").textContent = mobile.pairing_token_configured ? "已配置令牌；留空将保持原值。" : "尚未配置；启用前请填写至少 24 位随机字符。";

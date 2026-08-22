@@ -23,7 +23,7 @@ OpenCV 只用于任务触发的单帧读取，不会持续录像。AstrBot Deskt
 
 ## 移动端网关（供自建客户端对接）
 
-本插件可选地提供独立移动端网关，供你自行维护的客户端接入，不随本插件 Release 分发应用程序或安装包。网关以配对令牌换取短期会话令牌，可提供 Together 房间链接、接收前台位置上下文、维护屏幕共享状态并支持撤销会话。
+本插件可选地提供独立移动端网关，供你自行维护的客户端接入，不随本插件 Release 分发应用程序或安装包。网关以配对令牌换取短期会话令牌，可提供 Together 房间链接、接收前台位置上下文、维护屏幕共享状态、接收结构化身体/活动数据并支持撤销会话。
 
 从零配对和网络路线请参阅：[手机陪伴终端从零配对说明书](./手机陪伴终端从零配对说明书.md)。
 
@@ -45,16 +45,49 @@ OpenCV 只用于任务触发的单帧读取，不会持续录像。AstrBot Deskt
     "enabled": true,
     "host": "100.66.1.4",
     "port": 6322,
+    "public_base_url": "https://companion.example.com",
     "pairing_token": "至少 24 位随机长令牌",
     "allowed_user_id": "主要用户 ID",
     "session_ttl_hours": 168,
     "location_ttl_seconds": 900,
+    "amap_reverse_geocode_enabled": false,
+    "amap_api_key": "高德 Web 服务 API Key",
+    "amap_cache_ttl_seconds": 1800,
+    "amap_request_timeout_seconds": 5,
+    "telemetry_enabled": false,
+    "telemetry_ttl_seconds": 3600,
+    "activity_enabled": false,
+    "activity_ttl_seconds": 900,
     "screen_upload_enabled": true
   }
 }
 ```
 
-移动端独立端口的根路径包括 `/health`、`/pair`、`/status`、`/room/create`、`/location`、`/location/heartbeat`、`/location/revoke`、`/screen/heartbeat` 和 `/session/close`。位置心跳只延长已接收位置的有效期，不修改原始坐标或采集时间。服务端暂时保留 `/astrbot_plugin_reality_companion/mobile/*` 兼容别名，但新客户端应使用根路径。接口不会返回 CORS 许可头，所有敏感响应均标记为 `no-store`；除配对外均要求会话令牌，配对用户固定为服务端配置的 `allowed_user_id`。修改监听地址、端口或启用开关后请重启 Reality Companion（或重启 AstrBot）使独立服务重新绑定。
+### 高德区域识别
+
+高德接入是可选的位置语义增强：现实触及服务端收到手机位置后，使用高德 Web 服务 API 的逆地理编码得到城市、城区、街道和附近 POI，并按约百米网格做短期内存缓存。高德请求失败、超时或 Key 未配置时，位置上报和原有本地点位识别继续工作。
+
+陪伴插件只接收城市/城区级的 `area_label`，例如“上海市·徐汇区”，用于生成“今天一直在徐汇附近活动”这类模糊背景、区域天气匹配和通勤判断；精确坐标、完整地址和高德 Key 不会注入模型提示，也不会下发到手机。用户主动标记的“家、公司”等地点仍以本地地点认知地图为准，高德结果不会覆盖这些语义。
+
+建议先在高德开放平台创建仅启用“Web 服务 API”的 Key，再在本插件的“Android 网关 → 位置增强”中打开开关并填写。修改开关或 Key 后保存并重启 Reality Companion（或 AstrBot）使配置生效。
+
+Docker + Caddy/Nginx 反向代理时，建议将 `mobile.public_base_url` 设置为手机实际访问的 HTTPS 地址。未设置时，移动网关会按 `X-Forwarded-Host`、`X-Forwarded-Proto`、`Host` 的顺序解析外部地址；只有这些信息都不可用时才回退到本地监听地址。Caddy 至少应转发 `Host`、`X-Forwarded-Host` 和 `X-Forwarded-Proto`。
+
+移动端独立端口的根路径包括 `/health`、`/pair`、`/status`、`/room/create`、`/location`、`/location/heartbeat`、`/location/revoke`、`/device/status`、`/device/activity`、`/telemetry`、`/screen/heartbeat` 和 `/session/close`。设备状态、手机活动摘要、身体数据只保留短期内存态；位置心跳只延长已接收位置的有效期，不修改原始坐标或采集时间。伪窥屏使用 Android `UsageStatsManager`，必须由用户在手机设置中授予“使用情况访问”并在 App 内主动打开；服务端只接受应用类别和脱敏名称，不接收截图、窗口标题、通知或聊天内容。敏感应用默认只保留“私密应用”类别，陪伴插件以低置信度的“最近可能在使用……”语气使用摘要，不把它当成实时窥屏事实。`/telemetry` 仅在 `mobile.telemetry_enabled` 开启后接受最多 32 项结构化数值和受限活动状态，不接受自由文本，不做医疗诊断；陪伴插件只读取经过整理的短期摘要。服务端暂时保留 `/astrbot_plugin_reality_companion/mobile/*` 兼容别名，但新客户端应使用根路径。接口不会返回 CORS 许可头，所有敏感响应均标记为 `no-store`；除配对外均要求会话令牌，配对用户固定为服务端配置的 `allowed_user_id`。修改监听地址、端口或启用开关后请重启 Reality Companion（或重启 AstrBot）使独立服务重新绑定。
+
+外部应用上报示例：
+
+```json
+{
+  "source": "health_connect",
+  "captured_at": 1787132400,
+  "measurements": [
+    {"type": "heart_rate", "value": 78, "unit": "bpm"},
+    {"type": "steps", "value": 6420, "unit": "count"}
+  ],
+  "activity": {"state": "walking", "duration_minutes": 18}
+}
+```
 
 自建客户端的屏幕共享可复用 `astrbot_plugin_screen_companion` 的远程 WebSocket：开启 `remote_mode` 并设置 `remote_auth_token`。创建视频通话房间时，网关要求 Together 返回 HTTPS 地址；没有安全地址时会返回 `409`。组网链路应提供端到端加密；若不能保证加密，请在网关前增加 HTTPS 反向代理，避免配对密钥、会话令牌和位置数据以明文传输。
 

@@ -130,6 +130,13 @@
         "hint": "Android 端 AstrBot 地址应填写为 http://电脑组网地址:此端口。",
         "condition": {"enabled": true}
       },
+      "public_base_url": {
+        "description": "移动端外部访问地址",
+        "type": "string",
+        "default": "",
+        "hint": "Docker + Caddy/Nginx 反向代理时填写完整外部地址，例如 https://companion.example.com。留空时自动读取 X-Forwarded-Host/X-Forwarded-Proto，最后才回退到监听地址。",
+        "condition": {"enabled": true}
+      },
       "allowed_user_id": {
         "description": "绑定的 AstrBot 用户 ID",
         "type": "string",
@@ -151,6 +158,67 @@
         "slider": {"min": 60, "max": 86400, "step": 60},
         "default": 900,
         "condition": {"enabled": true}
+      },
+      "amap_reverse_geocode_enabled": {
+        "description": "启用高德逆地理编码",
+        "type": "bool",
+        "default": false,
+        "hint": "可选。将手机坐标转换为城市/城区级场景背景，辅助判断通勤、区域天气和生活节点。默认关闭；不会把精确地址写入陪伴提示词。",
+        "condition": {"enabled": true}
+      },
+      "amap_api_key": {
+        "description": "高德地图 Web 服务 API Key",
+        "type": "string",
+        "password": true,
+        "default": "",
+        "hint": "在高德开放平台创建 Web 服务 API Key。仅由现实触及服务端调用逆地理编码，不会下发到手机端、保存到位置记录或注入模型。",
+        "condition": {"enabled": true, "amap_reverse_geocode_enabled": true}
+      },
+      "amap_cache_ttl_seconds": {
+        "description": "高德区域结果缓存时间（秒）",
+        "type": "int",
+        "slider": {"min": 60, "max": 604800, "step": 60},
+        "default": 1800,
+        "hint": "相同约百米网格内的位置会复用结果，降低请求频率和隐私暴露面。",
+        "condition": {"enabled": true, "amap_reverse_geocode_enabled": true}
+      },
+      "amap_request_timeout_seconds": {
+        "description": "高德请求超时（秒）",
+        "type": "int",
+        "slider": {"min": 1, "max": 20, "step": 1},
+        "default": 5,
+        "hint": "请求失败时继续使用手机上报的地点和本地认知地图，不会阻塞位置上报主链。",
+        "condition": {"enabled": true, "amap_reverse_geocode_enabled": true}
+      },
+      "telemetry_enabled": {
+        "description": "允许接收外部身体与活动数据",
+        "type": "bool",
+        "default": false,
+        "hint": "仅接收经过结构化校验的数值和活动状态；默认关闭，不会因为安装更新而自动读取健康数据。",
+        "condition": {"enabled": true}
+      },
+      "telemetry_ttl_seconds": {
+        "description": "身体数据上下文有效期（秒）",
+        "type": "int",
+        "slider": {"min": 60, "max": 604800, "step": 60},
+        "default": 3600,
+        "hint": "数据只保留在内存中，超过有效期或重启插件后自动失效。",
+        "condition": {"enabled": true, "telemetry_enabled": true}
+      },
+      "activity_enabled": {
+        "description": "允许手机上报前台应用摘要",
+        "type": "bool",
+        "default": false,
+        "hint": "伪窥屏模式：只接收用户在手机端明确开启后上报的应用类别和脱敏名称，不接收截图、窗口标题或消息内容。数据只保留在内存中。",
+        "condition": {"enabled": true}
+      },
+      "activity_ttl_seconds": {
+        "description": "手机活动摘要有效期（秒）",
+        "type": "int",
+        "slider": {"min": 60, "max": 86400, "step": 60},
+        "default": 900,
+        "hint": "超过有效期后不会再注入陪伴上下文。",
+        "condition": {"enabled": true, "activity_enabled": true}
       },
       "proxy_rooms": {
         "description": "统一房间代理",

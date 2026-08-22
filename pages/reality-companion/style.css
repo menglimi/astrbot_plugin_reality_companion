@@ -97,6 +97,10 @@ h1, h2, h3, h4, p { margin: 0; }
 .panel-section { border: 1px solid var(--line); background: color-mix(in srgb, var(--surface) calc(var(--glass-alpha) * 100%), transparent); backdrop-filter: blur(var(--glass-blur)); -webkit-backdrop-filter: blur(var(--glass-blur)); }
 .section-head { min-height: 69px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 20px; border-bottom: 1px solid #e3e7ec; }
 .section-head h2 { font-size: 16px; }
+.nested-section { margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: color-mix(in srgb, var(--surface) 78%, var(--teal) 4%); }
+.nested-section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.nested-section-head p { margin-bottom: 4px; color: var(--teal); font-size: 10px; font-weight: 800; text-transform: uppercase; }
+.nested-section-head h3 { font-size: 14px; }
 .head-actions, .form-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
 .status-badge { min-height: 26px; display: inline-flex; align-items: center; padding: 4px 9px; border: 1px solid #d7dce2; border-radius: 4px; color: #5c6673; background: #f2f4f6; font-size: 10px; font-weight: 700; }
 .status-badge.good { color: #087554; border-color: #b9dfd1; background: #eaf7f2; }
@@ -232,6 +236,7 @@ input[type="range"] { width: 100%; margin: 6px 0; accent-color: var(--teal); }
 .theme-motion { min-height: 60px; padding: 11px 13px; background: color-mix(in srgb, var(--soft) 70%, transparent); }
 
 :root[data-theme="dark"] .section-head { border-bottom-color: var(--line); }
+:root[data-theme="dark"] .nested-section { background: color-mix(in srgb, var(--surface) 88%, var(--teal) 6%); }
 :root[data-theme="dark"] .metric small, :root[data-theme="dark"] .field small, :root[data-theme="dark"] .switch-row span small, :root[data-theme="dark"] .user-item small { color: #9eabb8; }
 :root[data-theme="dark"] .switch-row { border-color: var(--line); background: color-mix(in srgb, var(--soft) 82%, transparent); }
 :root[data-theme="dark"] .switch-row span b, :root[data-theme="dark"] .user-item, :root[data-theme="dark"] .button.secondary { color: var(--ink); }

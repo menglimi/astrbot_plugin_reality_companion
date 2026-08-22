@@ -10,6 +10,7 @@ import aiohttp
 
 import astrbot_plugin_reality_companion.mobile_gateway as mobile_gateway
 from astrbot_plugin_reality_companion.mobile_gateway import MobileGatewayMixin
+from astrbot_plugin_reality_companion.amap_geocode import amap_cache_key, normalize_amap_response
 
 
 class GatewayHarness(MobileGatewayMixin):
@@ -23,6 +24,10 @@ class GatewayHarness(MobileGatewayMixin):
                 "allowed_user_id": "owner-1",
                 "session_ttl_hours": 24,
                 "location_ttl_seconds": 900,
+                "telemetry_enabled": False,
+                "telemetry_ttl_seconds": 3600,
+                "activity_enabled": False,
+                "activity_ttl_seconds": 900,
                 "screen_upload_enabled": True,
             }
         }
@@ -88,6 +93,40 @@ def test_mobile_location_is_coarsened_and_expires() -> None:
     assert harness.mobile_context("owner-1")["available"] is False
 
 
+def test_amap_reverse_geocode_normalizes_area_without_exposing_full_address_to_prompt() -> None:
+    payload = {
+        "status": "1",
+        "regeocode": {
+            "formatted_address": "上海市徐汇区某路 1 号",
+            "addressComponent": {
+                "province": "上海市",
+                "city": "上海市",
+                "district": "徐汇区",
+                "township": "漕河泾街道",
+                "streetNumber": {"street": "某路", "number": "1号"},
+            },
+            "pois": [{"name": "某园区"}],
+        },
+    }
+    result = normalize_amap_response(payload)
+    assert result is not None
+    assert result["area_label"] == "上海市·徐汇区"
+    assert amap_cache_key(31.230416, 121.473701) == "31.230,121.474"
+
+    harness = GatewayHarness()
+    now = time.time()
+    harness._mobile_locations["owner-1"] = {
+        "latitude": 31.230416,
+        "longitude": 121.473701,
+        "accuracy_m": 23.456,
+        "captured_at": now,
+        "amap": result,
+    }
+    prompt_location = harness.mobile_context("owner-1")["location"]
+    assert prompt_location["place"]["area_label"] == "上海市·徐汇区"
+    assert "formatted_address" not in prompt_location["place"]
+
+
 def test_mobile_location_heartbeat_refreshes_retention_without_rewriting_capture() -> None:
     harness = GatewayHarness()
     captured_at = time.time() - 120
@@ -110,6 +149,207 @@ def test_mobile_location_heartbeat_refreshes_retention_without_rewriting_capture
     assert payload["ok"] is True
     assert harness._mobile_locations["owner-1"]["captured_at"] == captured_at
     assert harness._mobile_locations["owner-1"]["received_at"] > captured_at
+
+
+def test_mobile_device_status_records_app_state_and_battery() -> None:
+    harness = GatewayHarness()
+    token = "device-status-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+
+    payload, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_device_status,
+            token=token,
+            payload={
+                "app_state": "foreground",
+                "battery_percent": 78,
+                "charging": True,
+                "captured_at": time.time(),
+            },
+        )
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["data"]["available"] is True
+    assert payload["data"]["app_state"] == "foreground"
+    assert payload["data"]["battery_percent"] == 78
+    assert payload["data"]["charging"] is True
+
+    status_body = asyncio.run(harness._mobile_status_response({"user_id": "owner-1"}))
+    assert status_body["data"]["device"]["app_state"] == "foreground"
+    context = harness.mobile_context("owner-1")
+    assert context["device"]["battery_percent"] == 78
+
+
+def test_mobile_activity_requires_opt_in_and_redacts_private_apps() -> None:
+    harness = GatewayHarness()
+    token = "activity-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+    body, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_device_activity,
+            token=token,
+            payload={
+                "app_id": "com.example.bank",
+                "app_label": "My Bank",
+                "category": "work",
+                "consent": True,
+                "captured_at": time.time(),
+            },
+        )
+    )
+    assert status == 409
+    assert body["ok"] is False
+
+    harness.config["mobile"]["activity_enabled"] = True
+    body, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_device_activity,
+            token=token,
+            payload={
+                "app_id": "com.example.bank",
+                "app_label": "My Bank",
+                "category": "work",
+                "consent": True,
+                "captured_at": time.time(),
+            },
+        )
+    )
+    assert status == 200
+    assert body["data"]["category"] == "private"
+    assert body["data"]["app_label"] == "私密应用"
+    assert "app_id" not in harness.mobile_context("owner-1")["activity"]
+
+
+def test_mobile_activity_prompt_projection_is_short_lived_and_coarse() -> None:
+    harness = GatewayHarness()
+    harness.config["mobile"]["activity_enabled"] = True
+    token = "activity-session-safe"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+    body, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_device_activity,
+            token=token,
+            payload={
+                "app_id": "com.example.video",
+                "app_label": "视频站",
+                "category": "video",
+                "consent": True,
+                "captured_at": time.time(),
+            },
+        )
+    )
+    assert status == 200
+    activity = harness.mobile_context("owner-1")["activity"]
+    assert activity["category"] == "video"
+    assert activity["app_label"] == "视频站"
+    assert "app_id" not in activity
+    harness._mobile_activity["owner-1"]["received_at"] = time.time() - 901
+    assert harness.mobile_context("owner-1")["activity"]["available"] is False
+
+
+def test_mobile_activity_explicit_privacy_opt_out_keeps_bounded_app_metadata() -> None:
+    harness = GatewayHarness()
+    harness.config["mobile"]["activity_enabled"] = True
+    token = "activity-session-detailed"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+    body, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_device_activity,
+            token=token,
+            payload={
+                "app_id": "com.example.bank",
+                "app_label": "My Bank",
+                "display_title": "My Bank",
+                "category": "work",
+                "music_playing": True,
+                "music_source": "My Bank",
+                "privacy_mode": False,
+                "consent": True,
+                "captured_at": time.time(),
+            },
+        )
+    )
+    assert status == 200
+    assert body["data"]["app_label"] == "My Bank"
+    assert body["data"]["display_title"] == "My Bank"
+    assert body["data"]["music"]["playing"] is True
+    assert body["data"]["music"]["source"] == ""
+
+
+def test_mobile_telemetry_accepts_structured_measurements_and_exposes_safe_summary() -> None:
+    harness = GatewayHarness()
+    harness.config["mobile"]["telemetry_enabled"] = True
+    token = "telemetry-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+
+    body, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_telemetry,
+            token=token,
+            payload={
+                "source": "health_connect",
+                "captured_at": time.time(),
+                "measurements": [
+                    {"type": "heart_rate", "value": 78, "unit": "bpm"},
+                    {"type": "steps", "value": 6420, "unit": "count"},
+                    {"type": "ignored", "value": "prompt injection", "unit": "text"},
+                ],
+                "activity": {"state": "walking", "duration_minutes": 18},
+            },
+        )
+    )
+
+    assert status == 200
+    assert body["data"]["available"] is True
+    assert "心率 78.0 bpm" in body["data"]["summary"]
+    assert "当前活动：步行（约 18.0 分钟）" in body["data"]["summary"]
+    context = harness.mobile_context("owner-1")
+    assert context["telemetry"]["source"] == "user_authorized_external_telemetry"
+    assert all(item["type"] != "ignored" for item in context["telemetry"]["measurements"])
+
+
+def test_mobile_telemetry_is_disabled_by_default_and_expires() -> None:
+    harness = GatewayHarness()
+    token = "telemetry-disabled-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+    body, status = asyncio.run(
+        invoke_mobile(
+            harness.mobile_telemetry,
+            token=token,
+            payload={"measurements": [{"type": "steps", "value": 1, "unit": "count"}]},
+        )
+    )
+    assert status == 409
+    assert body["ok"] is False
+
+    harness.config["mobile"]["telemetry_enabled"] = True
+    harness.config["mobile"]["telemetry_ttl_seconds"] = 60
+    harness._mobile_telemetry["owner-1"] = {
+        "captured_at": time.time() - 120,
+        "received_at": time.time() - 120,
+        "measurements": {"steps": {"value": 1, "unit": "count", "captured_at": time.time() - 120}},
+    }
+    assert harness._mobile_telemetry_snapshot("owner-1")["available"] is False
 
 
 def test_mobile_location_notifies_private_companion_after_upload() -> None:
@@ -150,6 +390,89 @@ def test_mobile_location_notifies_private_companion_after_upload() -> None:
     assert calls == ["owner-1"]
 
 
+def test_mobile_location_amap_enrichment_is_backgrounded(monkeypatch) -> None:
+    harness = GatewayHarness()
+    harness.config["mobile"].update({
+        "amap_reverse_geocode_enabled": True,
+        "amap_api_key": "amap-test-key",
+    })
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_reverse_geocode(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return {"area_label": "上海市·徐汇区", "source": "amap_reverse_geocode"}
+
+    monkeypatch.setattr(mobile_gateway, "reverse_geocode", fake_reverse_geocode)
+    token = "location-amap-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+
+    async def scenario() -> tuple[dict, int]:
+        result = await invoke_mobile(
+            harness.mobile_location,
+            token=token,
+            payload={"latitude": 31.2, "longitude": 121.5, "captured_at": time.time()},
+        )
+        assert result[1] == 200
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert "amap" not in result[0]["data"]["place"]
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if harness._mobile_locations["owner-1"].get("amap"):
+                break
+        return result
+
+    asyncio.run(scenario())
+    assert harness._mobile_locations["owner-1"]["amap"]["area_label"] == "上海市·徐汇区"
+
+
+def test_mobile_location_notification_coalesces_uploads_during_slow_scheduler_wakeup() -> None:
+    harness = GatewayHarness()
+    calls: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class PrivateApi:
+        async def notify_mobile_location_update(self, user_id: str) -> dict:
+            calls.append(user_id)
+            started.set()
+            await release.wait()
+            return {"handled": True}
+
+    harness._private_companion_api = lambda: PrivateApi()
+    token = "location-coalesce-session"
+    harness._mobile_sessions[harness._mobile_token_key(token)] = {
+        "user_id": "owner-1",
+        "expires_at": time.time() + 60,
+    }
+
+    async def scenario() -> None:
+        payload = {
+            "latitude": 31.2,
+            "longitude": 121.5,
+            "accuracy_m": 18,
+            "captured_at": time.time(),
+            "place": {"matched": True, "name": "家", "kind": "home", "confidence": "confirmed"},
+        }
+        await invoke_mobile(harness.mobile_location, token=token, payload=payload)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await invoke_mobile(harness.mobile_location, token=token, payload={**payload, "latitude": 31.201})
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if len(calls) >= 2:
+                break
+
+    asyncio.run(scenario())
+
+    assert calls == ["owner-1", "owner-1"]
+
+
 def test_explicit_place_is_exposed_as_structured_environment_context() -> None:
     harness = GatewayHarness()
     now = time.time()
@@ -184,6 +507,8 @@ def test_mobile_api_registers_only_device_routes() -> None:
     assert "/astrbot_plugin_reality_companion/mobile/pair" in paths
     assert "/astrbot_plugin_reality_companion/mobile/location" in paths
     assert "/astrbot_plugin_reality_companion/mobile/location/heartbeat" in paths
+    assert "/astrbot_plugin_reality_companion/mobile/device/status" in paths
+    assert "/astrbot_plugin_reality_companion/mobile/telemetry" in paths
     assert "/astrbot_plugin_reality_companion/mobile/room/prepare" in paths
     assert "/astrbot_plugin_reality_companion/mobile/game/room/create" in paths
     assert "/astrbot_plugin_reality_companion/mobile/session/close" in paths
@@ -197,6 +522,31 @@ def test_room_loopback_url_uses_mobile_request_host(monkeypatch) -> None:
     monkeypatch.setattr(mobile_gateway, "request", fake_request)
     value = harness._mobile_rewrite_room_url("http://127.0.0.1:6321/join/ticket?mode=call")
     assert value == "http://100.66.1.4:6321/join/ticket?mode=call"
+
+
+def test_room_proxy_url_prefers_forwarded_public_origin(monkeypatch) -> None:
+    harness = GatewayHarness()
+    fake_request = types.SimpleNamespace(
+        headers={
+            "X-Forwarded-Host": "companion.xn--in0am32d.top",
+            "X-Forwarded-Proto": "https",
+        },
+        host="10.255.1.2:6322",
+    )
+    monkeypatch.setattr(mobile_gateway, "request", fake_request)
+    value = harness._mobile_room_url_via_gateway(
+        "http://127.0.0.1:6321/join/ticket?mode=call"
+    )
+    assert value == "https://companion.xn--in0am32d.top/join/ticket?mode=call"
+
+
+def test_room_proxy_url_accepts_configured_public_origin() -> None:
+    harness = GatewayHarness()
+    harness.config["mobile"]["public_base_url"] = "https://companion.example.com/mobile"
+    value = harness._mobile_room_url_via_gateway(
+        "http://127.0.0.1:6321/join/ticket?mode=call"
+    )
+    assert value == "https://companion.example.com/mobile/join/ticket?mode=call"
 
 
 def test_room_url_rewrite_rejects_host_injection_and_handles_ipv6(monkeypatch) -> None:

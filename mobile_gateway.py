@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .amap_geocode import amap_cache_key, reverse_geocode
+
 try:
     from quart import request
 except Exception:  # pragma: no cover - AstrBot supplies Quart at runtime
@@ -42,6 +44,15 @@ MOBILE_API_VERSION = "1.0"
 MOBILE_MAX_BODY_BYTES = 256 * 1024
 MOBILE_MAX_SESSIONS_PER_USER = 8
 MOBILE_PROXY_MAX_WS_BYTES = 16 * 1024 * 1024
+MOBILE_TELEMETRY_MAX_MEASUREMENTS = 32
+MOBILE_TELEMETRY_MAX_TYPES = 24
+MOBILE_ACTIVITY_MAX_LABEL = 80
+MOBILE_ACTIVITY_CATEGORIES = {"video", "music", "browser", "game", "social", "work", "reading", "private", "other"}
+MOBILE_PRIVATE_APP_MARKERS = (
+    "bank", "finance", "wallet", "password", "authenticator", "otp", "mail", "email",
+    "message", "sms", "chat", "wechat", "qq", "telegram", "signal", "whatsapp", "gov", "health",
+)
+MOBILE_ACTIVITY_LABEL_BLOCKLIST = ("忽略", "系统提示", "提示词", "指令", "prompt", "instruction", "执行命令")
 
 
 @dataclass(slots=True)
@@ -75,6 +86,10 @@ class MobileGatewayMixin:
     def _mobile_gateway_init(self) -> None:
         self._mobile_sessions: dict[str, dict[str, Any]] = {}
         self._mobile_locations: dict[str, dict[str, Any]] = {}
+        self._mobile_amap_cache: dict[str, dict[str, Any]] = {}
+        self._mobile_device_status: dict[str, dict[str, Any]] = {}
+        self._mobile_activity: dict[str, dict[str, Any]] = {}
+        self._mobile_telemetry: dict[str, dict[str, Any]] = {}
         self._mobile_screen_clients: dict[str, dict[str, Any]] = {}
         self._mobile_pair_attempts: dict[str, list[float]] = {}
         self._mobile_server_runner: Any | None = None
@@ -84,6 +99,8 @@ class MobileGatewayMixin:
         self._mobile_state_lock = threading.RLock()
         self._mobile_runtime_stopped = False
         self._mobile_location_notify_tasks: dict[str, asyncio.Task] = {}
+        self._mobile_location_notify_pending: set[str] = set()
+        self._mobile_location_enrich_tasks: dict[str, asyncio.Task] = {}
         self._mobile_proxy_session: Any | None = None
         self._mobile_room_upstream_cache: dict[str, str] = {}
 
@@ -128,8 +145,85 @@ class MobileGatewayMixin:
     def _mobile_location_ttl(self) -> int:
         return max(60, min(24 * 60 * 60, self._cfg_int("mobile.location_ttl_seconds", 900, 60, 24 * 60 * 60)))
 
+    def _mobile_amap_api_key(self) -> str:
+        return self._cfg_str("mobile.amap_api_key", "")
+
+    def _mobile_amap_enabled(self) -> bool:
+        return bool(self._mobile_amap_api_key()) and self._cfg_bool("mobile.amap_reverse_geocode_enabled", False)
+
+    def _mobile_amap_cache_ttl(self) -> int:
+        return max(60, min(7 * 24 * 60 * 60, self._cfg_int("mobile.amap_cache_ttl_seconds", 1800, 60, 7 * 24 * 60 * 60)))
+
+    def _mobile_amap_timeout_seconds(self) -> float:
+        return max(1.0, min(20.0, _number(self._cfg_str("mobile.amap_request_timeout_seconds", "5"), 5.0)))
+
+    async def _mobile_enrich_location_with_amap(self, item: dict[str, Any]) -> None:
+        if not self._mobile_amap_enabled() or not isinstance(item, dict):
+            return
+        key = amap_cache_key(item.get("latitude"), item.get("longitude"))
+        if not key:
+            return
+        now = time.time()
+        cached = self._mobile_amap_cache.get(key)
+        if isinstance(cached, dict) and now - _number(cached.get("cached_at")) <= self._mobile_amap_cache_ttl():
+            item["amap"] = dict(cached.get("result") or {})
+            return
+        result = await reverse_geocode(
+            item.get("latitude"),
+            item.get("longitude"),
+            api_key=self._mobile_amap_api_key(),
+            timeout_seconds=self._mobile_amap_timeout_seconds(),
+        )
+        if not isinstance(result, dict):
+            return
+        self._mobile_amap_cache[key] = {"cached_at": now, "result": dict(result)}
+        # Keep only a bounded in-memory cache. Location data is intentionally
+        # not persisted to disk.
+        if len(self._mobile_amap_cache) > 128:
+            oldest = sorted(self._mobile_amap_cache.items(), key=lambda pair: _number(pair[1].get("cached_at")))[:32]
+            for old_key, _value in oldest:
+                self._mobile_amap_cache.pop(old_key, None)
+        item["amap"] = result
+
+    def _schedule_mobile_amap_enrichment(self, user_id: str, item: dict[str, Any]) -> None:
+        """Enrich the newest location without delaying the mobile upload response."""
+        if not self._mobile_amap_enabled() or not isinstance(item, dict):
+            return
+        previous = self._mobile_location_enrich_tasks.get(user_id)
+        if previous is not None and not previous.done():
+            previous.cancel()
+
+        async def run() -> None:
+            try:
+                await self._mobile_enrich_location_with_amap(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[RealityCompanion] 高德区域增强失败: %s", _clean(exc, 160))
+
+        task = asyncio.create_task(run(), name="reality_mobile_amap_enrichment")
+        self._mobile_location_enrich_tasks[user_id] = task
+
+        def done(_completed: asyncio.Task) -> None:
+            if self._mobile_location_enrich_tasks.get(user_id) is task:
+                self._mobile_location_enrich_tasks.pop(user_id, None)
+
+        task.add_done_callback(done)
+
     def _mobile_screen_upload_enabled(self) -> bool:
         return bool(self._cfg_bool("mobile.screen_upload_enabled", True))
+
+    def _mobile_telemetry_enabled(self) -> bool:
+        return bool(self._cfg_bool("mobile.telemetry_enabled", False))
+
+    def _mobile_telemetry_ttl(self) -> int:
+        return max(60, min(7 * 24 * 60 * 60, self._cfg_int("mobile.telemetry_ttl_seconds", 3600, 60, 7 * 24 * 60 * 60)))
+
+    def _mobile_activity_enabled(self) -> bool:
+        return bool(self._cfg_bool("mobile.activity_enabled", False))
+
+    def _mobile_activity_ttl(self) -> int:
+        return max(60, min(24 * 60 * 60, self._cfg_int("mobile.activity_ttl_seconds", 900, 60, 24 * 60 * 60)))
 
     def _mobile_token_from_request(self) -> str:
         current = _mobile_request_state.get()
@@ -159,7 +253,64 @@ class MobileGatewayMixin:
         current = _mobile_request_state.get()
         if current is not None:
             return _clean(current.host, 180)
-        return _clean(getattr(request, "host", ""), 180) if request is not None else ""
+        if request is None:
+            return ""
+        try:
+            return _clean(getattr(request, "host", ""), 180)
+        except RuntimeError:
+            return ""
+
+    def _mobile_request_header(self, name: str) -> str:
+        current = _mobile_request_state.get()
+        if current is not None:
+            return _clean(current.headers.get(name.lower(), ""), 240)
+        if request is None:
+            return ""
+        try:
+            return _clean(request.headers.get(name, ""), 240)
+        except RuntimeError:
+            return ""
+
+    def _mobile_external_origin(self) -> str:
+        """Resolve the public origin used in mobile room links."""
+        configured = self._cfg_str("mobile.public_base_url", "").rstrip("/")
+        candidates: list[tuple[str, str]] = []
+        if configured:
+            candidates.append((configured, "configured"))
+        forwarded_host = self._mobile_request_header("X-Forwarded-Host")
+        request_host = self._mobile_request_header("Host")
+        socket_host = self._mobile_request_host()
+        host_value = forwarded_host or request_host or socket_host
+        host_value = host_value.split(",", 1)[0].strip()
+        forwarded_proto = self._mobile_request_header("X-Forwarded-Proto")
+        scheme_value = (forwarded_proto or "http").split(",", 1)[0].strip().lower()
+        if host_value:
+            source = "socket" if not forwarded_host and not request_host else "request"
+            candidates.append((f"{scheme_value}://{host_value}", source))
+
+        for raw, source in candidates:
+            try:
+                parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+                scheme = str(parsed.scheme or scheme_value or "http").lower()
+                if scheme not in {"http", "https"} or not parsed.netloc:
+                    continue
+                host = self._mobile_normalize_host(parsed.netloc)
+                if not host:
+                    continue
+                netloc = f"[{host}]" if ":" in host else host
+                if parsed.port is not None:
+                    netloc = f"{netloc}:{parsed.port}"
+                elif source == "socket":
+                    # The aiohttp transport only gives us the local address;
+                    # retain the mobile gateway port for direct connections.
+                    port = self._mobile_server_bound_port or self._mobile_port()
+                    if port:
+                        netloc = f"{netloc}:{port}"
+                path = str(parsed.path or "").rstrip("/")
+                return urlunsplit((scheme, netloc, path, "", ""))
+            except (TypeError, ValueError):
+                logger.debug("[RealityCompanion] 忽略无效移动端外部地址: source=%s value=%s", source, _clean(raw, 180))
+        return ""
 
     def _mobile_request_remote_addr(self) -> str:
         current = _mobile_request_state.get()
@@ -224,6 +375,33 @@ class MobileGatewayMixin:
             ]
             for user_id in stale_locations:
                 self._mobile_locations.pop(user_id, None)
+
+            stale_devices = [
+                user_id
+                for user_id, item in self._mobile_device_status.items()
+                if not isinstance(item, dict)
+                or now - _number(item.get("received_at")) > 24 * 60 * 60
+            ]
+            for user_id in stale_devices:
+                self._mobile_device_status.pop(user_id, None)
+
+            stale_telemetry = [
+                user_id
+                for user_id, item in self._mobile_telemetry.items()
+                if not isinstance(item, dict)
+                or now - _number(item.get("received_at")) > self._mobile_telemetry_ttl()
+            ]
+            for user_id in stale_telemetry:
+                self._mobile_telemetry.pop(user_id, None)
+
+            stale_activity = [
+                user_id
+                for user_id, item in self._mobile_activity.items()
+                if not isinstance(item, dict)
+                or now - _number(item.get("received_at")) > self._mobile_activity_ttl()
+            ]
+            for user_id in stale_activity:
+                self._mobile_activity.pop(user_id, None)
 
             stale_screen_clients = [
                 user_id
@@ -335,6 +513,18 @@ class MobileGatewayMixin:
             prompt_place["aliases"] = aliases
         if parent_name:
             prompt_place["parent_name"] = parent_name
+        amap = item.get("amap") if isinstance(item.get("amap"), dict) else {}
+        if prompt_safe:
+            area_label = _clean(amap.get("area_label"), 100)
+            if area_label:
+                prompt_place["area_label"] = area_label
+                prompt_place["area_source"] = "amap"
+        elif amap:
+            prompt_place["amap"] = {
+                key: _clean(amap.get(key), 180)
+                for key in ("province", "city", "district", "township", "street", "number", "poi", "formatted_address", "area_label", "source")
+                if _clean(amap.get(key), 180)
+            }
         return {
             "available": True,
             "latitude": round(_number(item.get("latitude")), 3),
@@ -365,16 +555,75 @@ class MobileGatewayMixin:
                 if normalized
                 else {"available": False, "reason": "user_missing"}
             )
+        device_snapshot = (
+            self._mobile_device_snapshot(normalized)
+            if normalized and not self._mobile_runtime_stopped and self._mobile_enabled()
+            else {"available": False, "reason": "mobile_gateway_disabled"}
+        )
         return {
             "available": bool(snapshot.get("available")),
             "user_id": normalized,
             "location": snapshot,
+            "device": device_snapshot,
+            "activity": (
+                self._mobile_activity_snapshot(normalized, prompt_safe=True)
+                if normalized and not self._mobile_runtime_stopped and self._mobile_enabled()
+                else {"available": False, "reason": "mobile_gateway_disabled"}
+            ),
+            "telemetry": (
+                self._mobile_telemetry_snapshot(normalized, prompt_safe=True)
+                if normalized and not self._mobile_runtime_stopped and self._mobile_enabled()
+                else {"available": False, "reason": "mobile_gateway_disabled"}
+            ),
             "privacy": {
                 "coordinates_rounded": True,
                 "foreground_only": True,
+                "device_status_short_lived": True,
+                "telemetry_short_lived": True,
+                "telemetry_prompt_safe_projection": True,
                 "expires_after_seconds": self._mobile_location_ttl(),
+                "telemetry_expires_after_seconds": self._mobile_telemetry_ttl(),
+                "activity_expires_after_seconds": self._mobile_activity_ttl(),
             },
         }
+
+    def _mobile_activity_snapshot(self, user_id: str, *, prompt_safe: bool = False) -> dict[str, Any]:
+        if not self._mobile_activity_enabled():
+            return {"available": False, "reason": "activity_disabled"}
+        self._mobile_cleanup_sessions()
+        with self._mobile_state_lock:
+            stored = self._mobile_activity.get(_clean(user_id, 120))
+            item = dict(stored) if isinstance(stored, dict) else None
+        if not isinstance(item, dict):
+            return {"available": False, "reason": "no_recent_activity"}
+        received_at = _number(item.get("received_at"))
+        captured_at = _number(item.get("captured_at"))
+        age = max(0, int(time.time() - received_at)) if received_at else 0
+        if not received_at or age > self._mobile_activity_ttl():
+            return {"available": False, "reason": "activity_expired", "age_seconds": age}
+        category = _clean(item.get("category"), 24).lower() or "other"
+        label = _clean(item.get("app_label"), MOBILE_ACTIVITY_MAX_LABEL)
+        if any(marker in label.lower() for marker in MOBILE_ACTIVITY_LABEL_BLOCKLIST):
+            label = "其他应用"
+        result = {
+            "available": True,
+            "category": category if category in MOBILE_ACTIVITY_CATEGORIES else "other",
+            "app_label": label or "其他应用",
+            "display_title": _clean(item.get("display_title"), MOBILE_ACTIVITY_MAX_LABEL) or label or "其他应用",
+            "captured_at": captured_at,
+            "last_report_at": received_at,
+            "age_seconds": age,
+            "stale": age > 5 * 60,
+            "source": "android_usage_summary",
+            "privacy_mode": bool(item.get("privacy_mode", True)),
+            "music": {
+                "playing": bool(item.get("music_playing")),
+                "source": _clean(item.get("music_source"), MOBILE_ACTIVITY_MAX_LABEL),
+            },
+        }
+        if not prompt_safe:
+            result["app_id"] = _clean(item.get("app_id"), 160)
+        return result
 
     async def _notify_private_companion_location(self, user_id: str) -> None:
         try:
@@ -395,6 +644,7 @@ class MobileGatewayMixin:
             return
         previous = self._mobile_location_notify_tasks.get(normalized)
         if isinstance(previous, asyncio.Task) and not previous.done():
+            self._mobile_location_notify_pending.add(normalized)
             return
         try:
             creator = getattr(self, "_create_lifecycle_background_task", None)
@@ -410,6 +660,9 @@ class MobileGatewayMixin:
         def clear(done: asyncio.Task) -> None:
             if self._mobile_location_notify_tasks.get(normalized) is done:
                 self._mobile_location_notify_tasks.pop(normalized, None)
+            if normalized in self._mobile_location_notify_pending:
+                self._mobile_location_notify_pending.discard(normalized)
+                self._schedule_private_companion_location_notification(normalized)
 
         task.add_done_callback(clear)
 
@@ -427,6 +680,123 @@ class MobileGatewayMixin:
             "client_id": _clean(item.get("client_id"), 100),
             "age_seconds": age,
         }
+
+    def _mobile_device_snapshot(self, user_id: str) -> dict[str, Any]:
+        self._mobile_cleanup_sessions()
+        with self._mobile_state_lock:
+            stored = self._mobile_device_status.get(_clean(user_id, 120))
+            item = dict(stored) if isinstance(stored, dict) else None
+        if not isinstance(item, dict):
+            return {"available": False, "reason": "no_recent_device_status"}
+        captured_at = _number(item.get("captured_at"))
+        received_at = _number(item.get("received_at"))
+        age = max(0, int(time.time() - received_at)) if received_at else 0
+        if not captured_at or not received_at:
+            return {"available": False, "reason": "invalid_device_status"}
+        return {
+            "available": True,
+            "online": age <= 5 * 60,
+            "device_name": _clean(item.get("device_name"), 120) or "Android 设备",
+            "platform": _clean(item.get("platform"), 24).lower() or "android",
+            "app_state": _clean(item.get("app_state"), 24) or "unknown",
+            "battery_percent": int(max(0, min(100, _number(item.get("battery_percent")))))
+            if item.get("battery_percent") is not None
+            else None,
+            "charging": bool(item.get("charging")),
+            "captured_at": captured_at,
+            "last_report_at": received_at,
+            "age_seconds": age,
+            "stale": age > 5 * 60,
+            "source": "android_device_status",
+        }
+
+    def _mobile_telemetry_snapshot(self, user_id: str, *, prompt_safe: bool = False) -> dict[str, Any]:
+        """Return a bounded, non-diagnostic projection of external measurements."""
+        if not self._mobile_telemetry_enabled():
+            return {"available": False, "reason": "telemetry_disabled"}
+        self._mobile_cleanup_sessions()
+        with self._mobile_state_lock:
+            stored = self._mobile_telemetry.get(_clean(user_id, 120))
+            item = dict(stored) if isinstance(stored, dict) else None
+        if not isinstance(item, dict):
+            return {"available": False, "reason": "no_recent_telemetry"}
+        received_at = _number(item.get("received_at"))
+        captured_at = _number(item.get("captured_at"))
+        age = max(0, int(time.time() - received_at)) if received_at else 0
+        if not received_at or age > self._mobile_telemetry_ttl():
+            return {"available": False, "reason": "telemetry_expired", "age_seconds": age}
+
+        measurements: list[dict[str, Any]] = []
+        now = time.time()
+        for key, raw in (item.get("measurements") or {}).items():
+            if not isinstance(raw, dict):
+                continue
+            name = _clean(key, 40).lower()
+            value = _number(raw.get("value"), float("nan"))
+            unit = _clean(raw.get("unit"), 16)
+            sample_at = _number(raw.get("captured_at"), captured_at)
+            if (
+                not name
+                or not math.isfinite(value)
+                or not unit
+                or not sample_at
+                or sample_at - now > 10 * 60
+                or now - sample_at > self._mobile_telemetry_ttl()
+            ):
+                continue
+            measurements.append({
+                "type": name,
+                "value": round(value, 3),
+                "unit": unit,
+                "captured_at": sample_at,
+            })
+        measurements.sort(key=lambda entry: entry["type"])
+        activity = item.get("activity") if isinstance(item.get("activity"), dict) else {}
+        activity_state = _clean(activity.get("state"), 24).lower()
+        activity_duration = _number(activity.get("duration_minutes"), 0.0)
+        summary_parts: list[str] = []
+        labels = {
+            "heart_rate": "心率",
+            "steps": "步数",
+            "sleep_duration": "睡眠时长",
+            "active_calories": "活动消耗",
+            "body_temperature": "体温",
+            "oxygen_saturation": "血氧",
+            "weight": "体重",
+            "exercise_minutes": "运动时长",
+        }
+        for entry in measurements[:MOBILE_TELEMETRY_MAX_MEASUREMENTS]:
+            label = labels.get(entry["type"], entry["type"])
+            summary_parts.append(f"{label} {entry['value']} {entry['unit']}")
+        if activity_state:
+            activity_labels = {
+                "walking": "步行",
+                "running": "跑步",
+                "cycling": "骑行",
+                "resting": "休息",
+                "sleeping": "睡眠",
+                "unknown": "活动状态未知",
+            }
+            text = activity_labels.get(activity_state, activity_state)
+            if activity_duration > 0:
+                text += f"（约 {round(activity_duration, 1)} 分钟）"
+            summary_parts.append(f"当前活动：{text}")
+        result = {
+            "available": bool(measurements or activity_state),
+            "captured_at": captured_at,
+            "received_at": received_at,
+            "age_seconds": age,
+            "source": _clean(item.get("source"), 48) or "external_telemetry",
+            "measurements": measurements,
+            "activity": {
+                "state": activity_state,
+                "duration_minutes": round(max(0.0, activity_duration), 1),
+            },
+            "summary": "；".join(summary_parts),
+        }
+        if prompt_safe:
+            result["source"] = "user_authorized_external_telemetry"
+        return result
 
     async def _mobile_game_status(self) -> dict[str, Any]:
         game = self._mobile_find_plugin("astrbot_plugin_game_companion")
@@ -447,7 +817,25 @@ class MobileGatewayMixin:
             }
         try:
             result = await self._mobile_call_gateway_aware(getter)
-            return result if isinstance(result, dict) else {
+            if isinstance(result, dict):
+                # 统一移动代理不依赖公网穿透。旧版游戏插件可能仍把
+                # cloudflared 缺失写入 blockers，但房间实际会经网关转发。
+                blockers = result.get("blockers")
+                if self._mobile_proxy_rooms_enabled() and isinstance(blockers, list):
+                    filtered = [
+                        item for item in blockers
+                        if not any(
+                            token in _clean(item, 180).lower()
+                            for token in ("cloudflared", "cloudflare tunnel", "cft 客户端", "cft客户端")
+                        )
+                    ]
+                    if len(filtered) != len(blockers):
+                        result = dict(result)
+                        result["blockers"] = filtered
+                        if result.get("ready") is False and not filtered:
+                            result["ready"] = bool(result.get("available", True))
+                return result
+            return {
                 "available": True,
                 "ready": False,
                 "blockers": ["游戏伴侣状态响应无效"],
@@ -517,6 +905,9 @@ class MobileGatewayMixin:
                 "user_id": user_id,
                 "reality": self._mobile_reality_status(),
                 "location": self._mobile_location_snapshot(user_id),
+                "device": self._mobile_device_snapshot(user_id),
+                "activity": self._mobile_activity_snapshot(user_id),
+                "telemetry": self._mobile_telemetry_snapshot(user_id),
                 "screen": self._mobile_screen_status(user_id),
                 "together": together_status,
                 "games": game_status,
@@ -526,6 +917,8 @@ class MobileGatewayMixin:
                     "watch": room_ready,
                     "work": room_ready and bool(work_capability.get("available")),
                     "location": True,
+                    "telemetry": self._mobile_telemetry_enabled(),
+                    "activity": self._mobile_activity_enabled(),
                     "screen_upload": self._mobile_screen_upload_enabled(),
                     "games": bool(game_status.get("ready")),
                 },
@@ -614,8 +1007,45 @@ class MobileGatewayMixin:
         """Prepare a room through the unified gateway, even for wrapped APIs."""
         access_preparer = getattr(together, "_ensure_mobile_room_access", None)
         if not callable(access_preparer):
+            if self._mobile_proxy_rooms_enabled():
+                room_server = getattr(together, "room_server", None)
+                starter = getattr(room_server, "start", None)
+                if callable(starter) and not bool(getattr(room_server, "running", False)):
+                    await starter()
+                local_url = str(getattr(room_server, "local_base_url", "") or "")
+                if local_url:
+                    return {
+                        "url": local_url,
+                        "tunnel_started": False,
+                        "tunnel_ready": True,
+                        "fixed_public_url": False,
+                        "mobile_gateway": True,
+                    }
             raise RuntimeError("一起房间插件版本过旧，缺少手机安全访问能力")
-        result = await self._mobile_call_gateway_aware(access_preparer)
+        try:
+            result = await self._mobile_call_gateway_aware(access_preparer)
+        except (RuntimeError, OSError) as exc:
+            # 兼容仍会强制启动 cloudflared 的旧版本。统一代理已经让
+            # 手机只访问本机网关，此时直接复用房间服务的本地监听即可。
+            if not self._mobile_proxy_rooms_enabled():
+                raise
+            reason = _clean(exc, 240).lower()
+            if not any(token in reason for token in ("cloudflared", "cloudflare", "cft", "公网访问", "公网地址")):
+                raise
+            room_server = getattr(together, "room_server", None)
+            starter = getattr(room_server, "start", None)
+            if callable(starter) and not bool(getattr(room_server, "running", False)):
+                await starter()
+            local_url = str(getattr(room_server, "local_base_url", "") or "")
+            if not local_url:
+                raise
+            return {
+                "url": local_url,
+                "tunnel_started": False,
+                "tunnel_ready": True,
+                "fixed_public_url": False,
+                "mobile_gateway": True,
+            }
         return result if isinstance(result, dict) else {}
 
     async def mobile_create_room(self) -> tuple[dict[str, Any], int]:
@@ -803,13 +1233,13 @@ class MobileGatewayMixin:
             parsed = urlsplit(str(room_url or ""))
             if not parsed.path:
                 return fallback
-            host = self._mobile_normalize_host(self._mobile_request_host())
-            if not host:
+            external_origin = self._mobile_external_origin()
+            if not external_origin:
                 return fallback
-            port = self._mobile_server_bound_port or self._mobile_port()
-            netloc = f"[{host}]" if ":" in host else host
+            base = urlsplit(external_origin)
+            path = f"{base.path.rstrip('/')}{parsed.path}"
             query = f"?{parsed.query}" if parsed.query else ""
-            return f"http://{netloc}:{port}{parsed.path}{query}"
+            return f"{base.scheme}://{base.netloc}{path}{query}"
         except Exception:
             return fallback
 
@@ -1009,8 +1439,187 @@ class MobileGatewayMixin:
         }
         with self._mobile_state_lock:
             self._mobile_locations[user_id] = item
+        self._schedule_mobile_amap_enrichment(user_id, item)
         self._schedule_private_companion_location_notification(user_id)
         return {"ok": True, "data": self._mobile_location_snapshot(user_id)}, 200
+
+    async def mobile_device_status(self) -> tuple[dict[str, Any], int]:
+        auth = self._mobile_authorize()
+        if not auth:
+            return self._mobile_json_error("未授权的移动端请求", 401)
+        payload = await self._mobile_request_payload()
+        app_state = _clean(payload.get("app_state"), 24).lower()
+        if app_state not in {"foreground", "background"}:
+            return self._mobile_json_error("应用状态无效", 400)
+        captured_at = _number(payload.get("captured_at"), time.time())
+        if captured_at > 10_000_000_000:
+            captured_at /= 1000.0
+        now = time.time()
+        if not math.isfinite(captured_at) or abs(now - captured_at) > 10 * 60:
+            return self._mobile_json_error("设备状态时间过旧，请重新上报", 400)
+        raw_battery = payload.get("battery_percent")
+        battery = _number(raw_battery) if raw_battery is not None else None
+        if battery is not None and (not math.isfinite(battery) or not 0 <= battery <= 100):
+            return self._mobile_json_error("电量百分比无效", 400)
+        user_id = _clean(auth.get("user_id"), 120)
+        item = {
+            "device_name": _clean(payload.get("device_name"), 120),
+            "platform": _clean(payload.get("platform"), 24).lower() or "android",
+            "app_state": app_state,
+            "battery_percent": round(battery, 1) if battery is not None else None,
+            "charging": bool(payload.get("charging")),
+            "captured_at": captured_at,
+            "received_at": now,
+        }
+        with self._mobile_state_lock:
+            self._mobile_device_status[user_id] = item
+        return {"ok": True, "data": self._mobile_device_snapshot(user_id)}, 200
+
+    async def mobile_device_activity(self) -> tuple[dict[str, Any], int]:
+        """Accept a consented, coarse foreground-app summary from Android."""
+        auth = self._mobile_authorize()
+        if not auth:
+            return self._mobile_json_error("未授权的移动端请求", 401)
+        if not self._mobile_activity_enabled():
+            return self._mobile_json_error("手机活动摘要未在配置中启用", 409)
+        payload = await self._mobile_request_payload()
+        if payload.get("consent") is not True:
+            return self._mobile_json_error("上报手机活动前需要明确同意", 409)
+        captured_at = _number(payload.get("captured_at"), time.time())
+        if captured_at > 10_000_000_000:
+            captured_at /= 1000.0
+        now = time.time()
+        if not math.isfinite(captured_at) or abs(now - captured_at) > 10 * 60:
+            return self._mobile_json_error("活动时间过旧，请重新上报", 400)
+        app_id = _clean(payload.get("app_id"), 160).lower()
+        app_label = _clean(payload.get("app_label"), MOBILE_ACTIVITY_MAX_LABEL)
+        display_title = _clean(payload.get("display_title") or app_label, MOBILE_ACTIVITY_MAX_LABEL)
+        category = _clean(payload.get("category"), 24).lower()
+        privacy_mode = payload.get("privacy_mode") is not False
+        music_playing = bool(payload.get("music_playing"))
+        music_source = _clean(payload.get("music_source"), MOBILE_ACTIVITY_MAX_LABEL)
+        if category not in MOBILE_ACTIVITY_CATEGORIES:
+            category = "other"
+        if not app_id and not app_label:
+            return self._mobile_json_error("活动摘要缺少应用信息", 400)
+        # Privacy mode keeps sensitive application identifiers out of the
+        # short-lived gateway state; the explicit opt-out is still bounded to
+        # app metadata and never grants access to notifications or screen data.
+        marker_text = f"{app_id} {app_label}".lower()
+        if privacy_mode and any(marker in marker_text for marker in MOBILE_PRIVATE_APP_MARKERS):
+            app_id = ""
+            app_label = "私密应用"
+            display_title = "私密应用"
+            category = "private"
+            music_source = ""
+        if any(marker in display_title.lower() for marker in MOBILE_ACTIVITY_LABEL_BLOCKLIST):
+            display_title = "其他应用"
+        if category != "music":
+            music_source = ""
+        item = {
+            "app_id": app_id,
+            "app_label": app_label or "其他应用",
+            "display_title": display_title or app_label or "其他应用",
+            "category": category,
+            "app_state": _clean(payload.get("app_state"), 24).lower() or "foreground",
+            "privacy_mode": privacy_mode,
+            "music_playing": music_playing,
+            "music_source": music_source,
+            "captured_at": captured_at,
+            "received_at": now,
+        }
+        user_id = _clean(auth.get("user_id"), 120)
+        with self._mobile_state_lock:
+            self._mobile_activity[user_id] = item
+        return {"ok": True, "data": self._mobile_activity_snapshot(user_id)}, 200
+
+    async def mobile_telemetry(self) -> tuple[dict[str, Any], int]:
+        """Accept a small, structured snapshot from an authorized external app."""
+        auth = self._mobile_authorize()
+        if not auth:
+            return self._mobile_json_error("未授权的移动端请求", 401)
+        if not self._mobile_telemetry_enabled():
+            return self._mobile_json_error("身体数据接收未在配置中启用", 409)
+        payload = await self._mobile_request_payload()
+        captured_at = _number(payload.get("captured_at"), time.time())
+        if captured_at > 10_000_000_000:
+            captured_at /= 1000.0
+        now = time.time()
+        if not math.isfinite(captured_at) or abs(now - captured_at) > 10 * 60:
+            return self._mobile_json_error("数据时间过旧，请重新上报", 400)
+
+        raw_measurements = payload.get("measurements")
+        if not isinstance(raw_measurements, list) or len(raw_measurements) > MOBILE_TELEMETRY_MAX_MEASUREMENTS:
+            return self._mobile_json_error("measurements 必须是最多 32 项的数组", 400)
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw in raw_measurements:
+            if not isinstance(raw, dict):
+                continue
+            name = _clean(raw.get("type"), 40).lower()
+            unit = _clean(raw.get("unit"), 16)
+            value = _number(raw.get("value"), float("nan"))
+            if (
+                not name
+                or not name.isascii()
+                or len(name) > 40
+                or not all(char.isalnum() or char in "_.-" for char in name)
+                or not unit
+                or not unit.isascii()
+                or not all(char.isalnum() or char in "%/_-" for char in unit)
+                or not math.isfinite(value)
+                or abs(value) > 1_000_000_000
+            ):
+                continue
+            if len(normalized) >= MOBILE_TELEMETRY_MAX_TYPES and name not in normalized:
+                continue
+            sample_time = _number(raw.get("captured_at"), captured_at)
+            if sample_time > 10_000_000_000:
+                sample_time /= 1000.0
+            if not math.isfinite(sample_time) or abs(now - sample_time) > 10 * 60:
+                continue
+            previous = normalized.get(name)
+            if previous is None or sample_time >= _number(previous.get("captured_at")):
+                normalized[name] = {
+                    "value": round(value, 3),
+                    "unit": unit,
+                    "captured_at": sample_time,
+                }
+
+        activity_payload = payload.get("activity") if isinstance(payload.get("activity"), dict) else {}
+        activity_state = _clean(activity_payload.get("state"), 24).lower()
+        allowed_activity_states = {"walking", "running", "cycling", "resting", "sleeping", "unknown"}
+        if activity_state and activity_state not in allowed_activity_states:
+            activity_state = "unknown"
+        duration = _number(activity_payload.get("duration_minutes"), 0.0)
+        if not math.isfinite(duration) or not 0 <= duration <= 1440:
+            duration = 0.0
+        if not normalized and not activity_state:
+            return self._mobile_json_error("没有可用的结构化数据", 400)
+
+        user_id = _clean(auth.get("user_id"), 120)
+        source = _clean(payload.get("source"), 48) or "external_telemetry"
+        if not source.isascii() or not all(char.isalnum() or char in "_.-" for char in source):
+            source = "external_telemetry"
+        with self._mobile_state_lock:
+            previous = self._mobile_telemetry.get(user_id)
+            merged = dict(previous) if isinstance(previous, dict) else {}
+            measurements = dict(merged.get("measurements") or {})
+            for name, sample in normalized.items():
+                old = measurements.get(name)
+                if not isinstance(old, dict) or sample["captured_at"] >= _number(old.get("captured_at")):
+                    measurements[name] = sample
+            merged.update({
+                "captured_at": max(captured_at, _number(merged.get("captured_at"), captured_at)),
+                "received_at": now,
+                "source": source,
+                "measurements": measurements,
+                "activity": {
+                    "state": activity_state,
+                    "duration_minutes": round(duration, 1),
+                },
+            })
+            self._mobile_telemetry[user_id] = merged
+        return {"ok": True, "data": self._mobile_telemetry_snapshot(user_id)}, 200
 
     async def mobile_screen_heartbeat(self) -> tuple[dict[str, Any], int]:
         auth = self._mobile_authorize()
@@ -1105,8 +1714,8 @@ class MobileGatewayMixin:
         local_host = str(socket_name[0]) if isinstance(socket_name, tuple) and socket_name else ""
         state = _MobileRequestState(
             headers={str(key).lower(): str(value) for key, value in aio_request.headers.items()},
-            # Use the accepted socket address rather than Host/X-Forwarded-Host,
-            # so a request cannot inject the hostname embedded in a room ticket.
+            # Keep the socket address as the trusted local fallback. Public room
+            # links are resolved separately from an explicit URL or proxy headers.
             host=local_host,
             remote_addr=str(aio_request.remote or ""),
             payload=payload,
@@ -1152,6 +1761,9 @@ class MobileGatewayMixin:
             ("POST", "/location", self.mobile_location),
             ("POST", "/location/heartbeat", self.mobile_location_heartbeat),
             ("POST", "/location/revoke", self.mobile_revoke_location),
+            ("POST", "/device/status", self.mobile_device_status),
+            ("POST", "/device/activity", self.mobile_device_activity),
+            ("POST", "/telemetry", self.mobile_telemetry),
             ("POST", "/screen/heartbeat", self.mobile_screen_heartbeat),
             ("POST", "/session/close", self.mobile_close_session),
         )
@@ -1253,8 +1865,16 @@ class MobileGatewayMixin:
                 with self._mobile_state_lock:
                     self._mobile_sessions.clear()
                     self._mobile_locations.clear()
+                    self._mobile_device_status.clear()
+                    self._mobile_activity.clear()
+                    self._mobile_telemetry.clear()
                     self._mobile_screen_clients.clear()
                     self._mobile_pair_attempts.clear()
+                    self._mobile_location_notify_pending.clear()
+                for task in list(self._mobile_location_enrich_tasks.values()):
+                    if not task.done():
+                        task.cancel()
+                self._mobile_location_enrich_tasks.clear()
 
     def _register_mobile_api(self) -> None:
         register_api = getattr(self.context, "register_web_api", None)
@@ -1278,5 +1898,8 @@ class MobileGatewayMixin:
         register_api(f"{prefix}/location", route(self.mobile_location), ["POST"], "Reality Companion mobile location")
         register_api(f"{prefix}/location/heartbeat", route(self.mobile_location_heartbeat), ["POST"], "Reality Companion mobile location heartbeat")
         register_api(f"{prefix}/location/revoke", route(self.mobile_revoke_location), ["POST"], "Reality Companion revoke mobile location")
+        register_api(f"{prefix}/device/status", route(self.mobile_device_status), ["POST"], "Reality Companion mobile device status")
+        register_api(f"{prefix}/device/activity", route(self.mobile_device_activity), ["POST"], "Reality Companion mobile activity summary")
+        register_api(f"{prefix}/telemetry", route(self.mobile_telemetry), ["POST"], "Reality Companion mobile telemetry")
         register_api(f"{prefix}/screen/heartbeat", route(self.mobile_screen_heartbeat), ["POST"], "Reality Companion mobile screen status")
         register_api(f"{prefix}/session/close", route(self.mobile_close_session), ["POST"], "Reality Companion mobile close")

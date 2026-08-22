@@ -34,7 +34,7 @@ from .wakeup_alarm import WakeupAlarmMixin
 
 
 PLUGIN_NAME = "astrbot_plugin_reality_companion"
-PLUGIN_VERSION = "0.2.7"
+PLUGIN_VERSION = "0.2.8"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 MANAGED_PAGE_MESSAGE = (
     "当前能力已由“我会永远陪着你”统一管理，请前往陪伴插件的“陪伴面板”继续操作。"
@@ -140,6 +140,56 @@ class RealityCompanionExtensionAPI:
 
     def page_snapshot(self) -> dict[str, Any]:
         return copy.deepcopy(self._plugin._reality_touch_page_snapshot())
+
+    def list_external_reality_capabilities(self) -> list[dict[str, Any]]:
+        """Expose provider metadata without exposing provider internals."""
+        api = self._plugin._private_companion_api()
+        getter = getattr(api, "list_reality_touch_providers", None) if api is not None else None
+        result = getter() if callable(getter) else []
+        return result if isinstance(result, list) else []
+
+    async def call_external_reality_capability(
+        self,
+        provider: str,
+        operation: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call a registered provider; failures stay isolated from audio/chat."""
+        api = self._plugin._private_companion_api()
+        caller = getattr(api, "call_reality_touch_provider", None) if api is not None else None
+        if not callable(caller):
+            return {"ok": False, "reason": "private_companion_unavailable"}
+        normalized_operation = _single_line(operation, 64).lower()
+        request = dict(payload or {})
+        if normalized_operation in {"run_scene", "control_device", "get_health_summary"}:
+            user_id = _single_line(request.get("user_id"), 120)
+            context_getter = getattr(api, "get_reality_touch_host_context", None)
+            context = context_getter(user_id) if callable(context_getter) else {}
+            if not isinstance(context, dict) or context.get("eligible") is not True:
+                return {"ok": False, "reason": "user_not_authorized"}
+            if normalized_operation in {"run_scene", "control_device"} and request.get("confirmed") is not True:
+                return {"ok": False, "reason": "explicit_confirmation_required"}
+        try:
+            result = await caller(provider, normalized_operation, request)
+        except Exception:
+            return {"ok": False, "reason": "provider_call_failed"}
+        return result if isinstance(result, dict) else {"ok": bool(result)}
+
+    async def resolve_external_reality_request(self, user_id: str, request: str) -> dict[str, Any]:
+        """Let the companion model translate a natural-language home/health request."""
+        api = self._plugin._private_companion_api()
+        resolver = getattr(api, "resolve_reality_touch_request", None) if api is not None else None
+        if not callable(resolver):
+            return {"ok": False, "reason": "private_companion_planner_unavailable"}
+        context_getter = getattr(api, "get_reality_touch_host_context", None)
+        context = context_getter(user_id) if callable(context_getter) else {}
+        if not isinstance(context, dict) or context.get("eligible") is not True:
+            return {"ok": False, "reason": "user_not_authorized"}
+        try:
+            result = await resolver(_single_line(user_id, 120), _single_line(request, 500))
+        except Exception:
+            return {"ok": False, "reason": "planner_failed"}
+        return result if isinstance(result, dict) else {"ok": bool(result)}
 
     async def page_action(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._plugin._perform_page_action(dict(payload or {}))
@@ -812,6 +862,14 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
                 "pairing_configured": bool(self._mobile_pairing_token()),
                 "session_ttl_hours": self._mobile_session_ttl() // 3600,
                 "location_ttl_seconds": self._mobile_location_ttl(),
+                "amap_reverse_geocode_enabled": self._mobile_amap_enabled(),
+                "amap_api_key_configured": bool(self._mobile_amap_api_key()),
+                "amap_cache_ttl_seconds": self._mobile_amap_cache_ttl(),
+                "amap_request_timeout_seconds": self._mobile_amap_timeout_seconds(),
+                "telemetry_enabled": self._mobile_telemetry_enabled(),
+                "telemetry_ttl_seconds": self._mobile_telemetry_ttl(),
+                "activity_enabled": self._mobile_activity_enabled(),
+                "activity_ttl_seconds": self._mobile_activity_ttl(),
                 "active_sessions": len(self._mobile_sessions),
                 "screen_upload_enabled": self._mobile_screen_upload_enabled(),
             },
@@ -1004,6 +1062,32 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         delivered, detail = await self._execute_official_reality_touch_reminder(event, text)
         prefix = "Reality touch reminder delivered: " if delivered else "Reality touch reminder failed: "
         return prefix + (_single_line(detail, 180) or "unknown result")
+
+    @filter.llm_tool(name="pc_reality_touch_action")
+    async def pc_reality_touch_action(self, event: AstrMessageEvent, request: str) -> str:
+        """将自然语言家居/健康请求交给现实触及能力规划器。"""
+        user_id = self._private_user_id_for_event(event)
+        user = self._user(user_id, create=False)
+        if not isinstance(user, dict) or not self._reality_touch_audio_consented(user):
+            return "现实触及尚未完成本机音频授权。"
+        result = await self.extension_api.resolve_external_reality_request(user_id, request)
+        if result.get("ok") is not True:
+            return "现实触及暂时无法完成该请求，请稍后再试。"
+        if result.get("handled") is False:
+            return "这句话暂时没有明确的家居或健康操作，我先不替你操作设备。"
+        if result.get("operation") == "run_scene":
+            if result.get("reason") == "explicit_confirmation_required":
+                return "这个家居场景需要你明确确认后才能执行。"
+            if result.get("ok") is True:
+                return f"已执行米家场景：{_single_line(result.get('scene_name'), 80) or '指定场景'}。"
+            return "米家场景执行失败，现实触及没有声称已经完成。"
+        if result.get("operation") == "control_device":
+            if result.get("reason") == "explicit_confirmation_required":
+                return "这个设备控制需要你明确确认后才能执行。"
+            if result.get("ok") is True:
+                return "设备控制已执行。"
+            return "设备控制失败，现实触及没有声称已经完成。"
+        return "已获取相关现实状态，具体结果将在当前回复中继续说明。"
 
     @filter.llm_tool(name="pc_reality_touch_camera_snapshot")
     async def pc_reality_touch_camera_snapshot(self, event: AstrMessageEvent, purpose: str) -> str:
@@ -1398,6 +1482,14 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
                 "allowed_user_id": self._mobile_allowed_user_id(),
                 "session_ttl_hours": self._cfg_int("mobile.session_ttl_hours", 168, 1, 720),
                 "location_ttl_seconds": self._mobile_location_ttl(),
+                "amap_reverse_geocode_enabled": self._mobile_amap_enabled(),
+                "amap_api_key_configured": bool(self._mobile_amap_api_key()),
+                "amap_cache_ttl_seconds": self._mobile_amap_cache_ttl(),
+                "amap_request_timeout_seconds": self._mobile_amap_timeout_seconds(),
+                "telemetry_enabled": self._mobile_telemetry_enabled(),
+                "telemetry_ttl_seconds": self._mobile_telemetry_ttl(),
+                "activity_enabled": self._mobile_activity_enabled(),
+                "activity_ttl_seconds": self._mobile_activity_ttl(),
                 "proxy_rooms": self._cfg_bool("mobile.proxy_rooms", True),
                 "screen_upload_enabled": self._mobile_screen_upload_enabled(),
                 "pairing_token_configured": bool(self._mobile_pairing_token()),
@@ -1438,6 +1530,13 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
             "allowed_user_id": _single_line(mobile.get("allowed_user_id"), 120),
             "session_ttl_hours": _safe_int(mobile.get("session_ttl_hours"), 168, 1, 720),
             "location_ttl_seconds": _safe_int(mobile.get("location_ttl_seconds"), 900, 60, 86400),
+            "amap_reverse_geocode_enabled": self._coerce_config_bool(mobile.get("amap_reverse_geocode_enabled"), False),
+            "amap_cache_ttl_seconds": _safe_int(mobile.get("amap_cache_ttl_seconds"), 1800, 60, 604800),
+            "amap_request_timeout_seconds": _safe_int(mobile.get("amap_request_timeout_seconds"), 5, 1, 20),
+            "telemetry_enabled": self._coerce_config_bool(mobile.get("telemetry_enabled"), False),
+            "telemetry_ttl_seconds": _safe_int(mobile.get("telemetry_ttl_seconds"), 3600, 60, 604800),
+            "activity_enabled": self._coerce_config_bool(mobile.get("activity_enabled"), False),
+            "activity_ttl_seconds": _safe_int(mobile.get("activity_ttl_seconds"), 900, 60, 86400),
             "proxy_rooms": self._coerce_config_bool(mobile.get("proxy_rooms"), True),
             "screen_upload_enabled": self._coerce_config_bool(mobile.get("screen_upload_enabled"), True),
         }
@@ -1446,6 +1545,9 @@ class RealityCompanionPlugin(MobileGatewayMixin, WakeupAlarmMixin, Star):
         pairing_token = _single_line(mobile.get("pairing_token"), 240)
         if pairing_token:
             self._set_group_config_field("mobile", "pairing_token", pairing_token)
+        amap_api_key = _single_line(mobile.get("amap_api_key"), 240)
+        if amap_api_key:
+            self._set_group_config_field("mobile", "amap_api_key", amap_api_key)
 
         saver = getattr(self.config, "save_config", None)
         if callable(saver):

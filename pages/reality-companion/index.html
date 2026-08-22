@@ -140,9 +140,22 @@
                 <label class="field"><span>配对令牌</span><input id="mobile-token" type="password" autocomplete="new-password" placeholder="留空保持原令牌" /><small id="mobile-token-note">建议至少 24 位随机字符。</small></label>
                 <label class="field"><span>会话有效期（小时）</span><input id="mobile-session-ttl" type="number" min="1" max="720" /></label>
                 <label class="field"><span>位置上下文有效期（秒）</span><input id="mobile-location-ttl" type="number" min="60" max="86400" step="60" /></label>
+                <label class="field"><span>身体数据有效期（秒）</span><input id="mobile-telemetry-ttl" type="number" min="60" max="604800" step="60" /></label>
+                <label class="field"><span>活动摘要有效期（秒）</span><input id="mobile-activity-ttl" type="number" min="60" max="86400" step="60" /></label>
               </div>
+              <section class="nested-section">
+                <div class="nested-section-head"><div><p>位置增强</p><h3>高德区域识别</h3></div><span class="status-badge" id="mobile-amap-badge">未配置</span></div>
+                <label class="switch-row full"><span><b>启用高德逆地理编码</b><small>把手机坐标转换为城市/城区背景，用于通勤、天气和生活场景；不会把精确地址写入陪伴提示。</small></span><input id="mobile-amap-enabled" type="checkbox" /><i aria-hidden="true"></i></label>
+                <div class="field-grid three">
+                  <label class="field"><span>高德 Web 服务 Key</span><input id="mobile-amap-key" type="password" autocomplete="new-password" placeholder="留空保持已配置 Key" /><small id="mobile-amap-key-note">Key 仅保存在服务端，不会下发到手机。</small></label>
+                  <label class="field"><span>区域缓存（秒）</span><input id="mobile-amap-cache-ttl" type="number" min="60" max="604800" step="60" /><small>约百米网格内复用结果，减少请求。</small></label>
+                  <label class="field"><span>请求超时（秒）</span><input id="mobile-amap-timeout" type="number" min="1" max="20" step="1" /><small>失败时继续使用原有位置上下文。</small></label>
+                </div>
+              </section>
               <label class="switch-row full"><span><b>统一代理一起 / 游戏 / 协同房间</b><small>手机只访问移动网关，由网关转发页面、接口、媒体与 WebSocket；推荐保持开启。</small></span><input id="mobile-proxy-rooms" type="checkbox" /><i aria-hidden="true"></i></label>
               <label class="switch-row full"><span><b>允许屏幕共享状态上报</b><small>Screen Companion 仍需单独配置远程识屏和令牌。</small></span><input id="mobile-screen" type="checkbox" /><i aria-hidden="true"></i></label>
+              <label class="switch-row full"><span><b>允许接收身体与活动数据</b><small>仅接收结构化数值和活动状态，默认关闭；数据只在内存中短期保留，不用于医疗诊断。</small></span><input id="mobile-telemetry" type="checkbox" /><i aria-hidden="true"></i></label>
+              <label class="switch-row full"><span><b>允许手机上报前台应用摘要（伪窥屏）</b><small>须由用户在 Android 端主动开启“手机活动摘要”并授予“使用情况访问”；不接收截图、窗口标题或消息内容。</small></span><input id="mobile-activity" type="checkbox" /><i aria-hidden="true"></i></label>
               <div class="form-actions"><button class="button primary" type="submit">保存并重启网关</button></div>
             </form>
           </section>
